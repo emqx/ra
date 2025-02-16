@@ -52,6 +52,7 @@
          ping/2,
          log_fold/4,
          transfer_leadership/3,
+         force_forget_member/3,
          force_shrink_members_to_current_member/1
         ]).
 
@@ -243,6 +244,10 @@ trigger_election(ServerId, Timeout) ->
     ok | already_leader | {error, term()} | {timeout, ra_server_id()}.
 transfer_leadership(ServerId, TargetServerId, Timeout) ->
     leader_call(ServerId, {transfer_leadership, TargetServerId}, Timeout).
+
+-spec force_forget_member(ra_server_id(), ra_server_id(), timeout()) -> ok.
+force_forget_member(ServerId, ForgetServerId, Timeout) ->
+    gen_statem_safe_call(ServerId, {force_forget_member, ForgetServerId}, Timeout).
 
 -spec force_shrink_members_to_current_member(ra_server_id()) -> ok.
 force_shrink_members_to_current_member(ServerId) ->
