@@ -46,6 +46,7 @@ all_tests() ->
      %% TODO: mt decide on whether to support this
      % external_reader,
      add_member_without_quorum,
+     force_forget_lost_servers,
      force_start_follower_as_single_member,
      force_start_follower_as_single_member_nonvoter,
      force_start_nonvoter_as_single_member,
@@ -711,6 +712,45 @@ add_member_without_quorum(Config) ->
     {error, not_member} = ra:remove_member(InitialCluster, ServerId5),
     %%
     % timer:sleep(5000),
+    ok.
+
+force_forget_lost_servers(Config) ->
+    ok = logger:set_primary_config(level, all),
+    %% ra:start_server should fail if the node already exists
+    ClusterName = ?config(cluster_name, Config),
+    ServerId1 = ?config(server_id, Config),
+    ServerId2 = ?config(server_id2, Config),
+    ServerId3 = ?config(server_id3, Config),
+    ServerId4 = ?config(server_id4, Config),
+    ServerId5 = ?config(server_id5, Config),
+    InitialCluster = [ServerId1, ServerId2, ServerId3, ServerId4, ServerId5],
+    ok = start_cluster(ClusterName, InitialCluster),
+    timer:sleep(100),
+    %% stop majority to simulate permanent outage
+    ok = ra:stop_server(?SYS, ServerId3),
+    ok = ra:stop_server(?SYS, ServerId4),
+    ok = ra:stop_server(?SYS, ServerId5),
+
+    timer:sleep(100),
+    %% forget most of the "lost" members
+    ok = ra_server_proc:force_forget_member(ServerId1, ServerId4, 1000),
+    ok = ra_server_proc:force_forget_member(ServerId1, ServerId5, 1000),
+    %% can't forget myself / already forgotten
+    {error, not_member} = ra_server_proc:force_forget_member(ServerId1, ServerId1, 1000),
+    {error, not_member} = ra_server_proc:force_forget_member(ServerId1, ServerId5, 1000),
+    %% should be able to acquire leadership now
+    {ok, [_, _, _], ServerId1} = ra:members(ServerId1),
+    timer:sleep(100),
+    %% and remove the last "lost" server
+    {ok, _IdxTerm, ServerId1} = ra:remove_member(ServerId1, ServerId3),
+    ok = enqueue(ServerId1, msg1),
+
+    %% test that it works after restart
+    ok = ra:stop_server(?SYS, ServerId1),
+    ok = ra:restart_server(?SYS, ServerId1),
+    {ok, [_, _], ServerId2} = ra:members(ServerId1),
+    ok = enqueue(ServerId1, msg2),
+
     ok.
 
 force_start_follower_as_single_member(Config) ->

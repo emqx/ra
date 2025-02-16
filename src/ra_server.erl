@@ -930,6 +930,12 @@ handle_leader({transfer_leadership, ServerId},
 handle_leader({register_external_log_reader, Pid}, #{log := Log0} = State) ->
     {Log, Effs} = ra_log:register_reader(Pid, Log0),
     {leader, State#{log => Log}, Effs};
+handle_leader({force_forget_member, ServerId} = Event,
+              #{cfg := #cfg{id = Id}, cluster := Cluster} = State0)
+  when Id =/= ServerId, is_map_key(ServerId, Cluster) ->
+    {follower, State0#{votes => 0}, [{next_event, Event}]};
+handle_leader({force_forget_member, _ServerId}, State) ->
+    {leader, State, [{reply, {error, not_member}}]};
 handle_leader(force_member_change, State0) ->
     {follower, State0#{votes => 0}, [{next_event, force_member_change}]};
 handle_leader(Msg, State) ->
@@ -1041,6 +1047,12 @@ handle_candidate(election_timeout, State) ->
 handle_candidate({register_external_log_reader, Pid}, #{log := Log0} = State) ->
     {Log, Effs} = ra_log:register_reader(Pid, Log0),
     {candidate, State#{log => Log}, Effs};
+handle_candidate({force_forget_member, ServerId} = Event,
+                 #{cfg := #cfg{id = Id}, cluster := Cluster} = State0)
+  when Id =/= ServerId, is_map_key(ServerId, Cluster) ->
+    {follower, State0#{votes => 0}, [{next_event, Event}]};
+handle_candidate({force_forget_member, _ServerId}, State) ->
+    {candidate, State, [{reply, {error, not_member}}]};
 handle_candidate(force_member_change, State0) ->
     {follower, State0#{votes => 0}, [{next_event, force_member_change}]};
 handle_candidate(#info_rpc{term = Term} = Msg,
@@ -1142,6 +1154,12 @@ handle_pre_vote({ra_log_event, Evt}, State = #{log := Log0}) ->
 handle_pre_vote({register_external_log_reader, Pid}, #{log := Log0} = State) ->
     {Log, Effs} = ra_log:register_reader(Pid, Log0),
     {pre_vote, State#{log => Log}, Effs};
+handle_pre_vote({force_forget_member, ServerId} = Event,
+                #{cfg := #cfg{id = Id}, cluster := Cluster} = State0)
+  when Id =/= ServerId, is_map_key(ServerId, Cluster) ->
+    {follower, State0#{votes => 0}, [{next_event, Event}]};
+handle_pre_vote({force_forget_member, _ServerId}, State) ->
+    {pre_vote, State, [{reply, {error, not_member}}]};
 handle_pre_vote(force_member_change, State0) ->
     {follower, State0#{votes => 0}, [{next_event, force_member_change}]};
 handle_pre_vote(#info_rpc{term = Term} = Msg,
@@ -1494,6 +1512,18 @@ handle_follower(try_become_leader, State) ->
 handle_follower({register_external_log_reader, Pid}, #{log := Log0} = State) ->
     {Log, Effs} = ra_log:register_reader(Pid, Log0),
     {follower, State#{log => Log}, Effs};
+handle_follower({force_forget_member, ServerId},
+                #{cfg := #cfg{id = Id, log_id = LogId},
+                  cluster := Cluster0} = State0)
+  when Id =/= ServerId, is_map_key(ServerId, Cluster0) ->
+    Cluster = maps:remove(ServerId, Cluster0),
+    ?WARN("~ts: Forcing cluster change to forget ~p. New cluster ~w",
+          [LogId, ServerId, Cluster]),
+    {ok, _, _, State, Effects} =
+        append_cluster_change(Cluster, undefined, no_reply, State0, []),
+    call_for_election(pre_vote, State, [{reply, ok} | Effects]);
+handle_follower({force_forget_member, _ServerId}, State) ->
+    {follower, State, [{reply, {error, not_member}}]};
 handle_follower(force_member_change,
                 #{cfg := #cfg{id = Id,
                               uid = Uid,
