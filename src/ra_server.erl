@@ -3106,7 +3106,8 @@ append_log_leader(Cmd, #{log := Log0, current_term := Term} = State, Effects) ->
     end.
 
 pre_append_log_follower({Idx, Term, Cmd} = Entry,
-                        State = #{cluster_index_term := {Idx, CITTerm}})
+                        State = #{cluster_index_term := {Idx, CITTerm},
+                                  id := Id})
   when Term /= CITTerm ->
     % the index for the cluster config entry has a different term, i.e.
     % it has been overwritten by a new leader. Unless it is another cluster
@@ -3120,7 +3121,14 @@ pre_append_log_follower({Idx, Term, Cmd} = Entry,
                    cluster_index_term => {Idx, Term}};
         _ ->
             % revert back to previous cluster
-            {PrevIdx, PrevTerm, PrevCluster} = maps:get(previous_cluster, State),
+            {PrevIdx, PrevTerm, PrevCluster} =
+                case State of
+                    #{previous_cluster := Prev} ->
+                        Prev;
+                    #{} ->
+                        InitialMembers = state_query(initial_members, State),
+                        {0, 0, make_cluster(Id, InitialMembers)}
+                end,
             ?DEBUG("~ts: ~ts: follower reverting cluster change to ~w",
                    [log_id(State), ?FUNCTION_NAME, maps:keys(PrevCluster)]),
             State1 = State#{cluster => PrevCluster,
