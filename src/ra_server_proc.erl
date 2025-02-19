@@ -245,7 +245,8 @@ trigger_election(ServerId, Timeout) ->
 transfer_leadership(ServerId, TargetServerId, Timeout) ->
     leader_call(ServerId, {transfer_leadership, TargetServerId}, Timeout).
 
--spec force_forget_member(ra_server_id(), ra_server_id(), timeout()) -> ok.
+-spec force_forget_member(ra_server_id(), ra_server_id(), timeout()) ->
+    ok | {error, not_member} | {error, term()} | timeout.
 force_forget_member(ServerId, ForgetServerId, Timeout) ->
     gen_statem_safe_call(ServerId, {force_forget_member, ForgetServerId}, Timeout).
 
