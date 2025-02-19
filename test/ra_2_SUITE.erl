@@ -767,20 +767,22 @@ add_remove_confirm_member(Config) ->
     %% instead start the followers
     [ra:restart_server(?SYS, F) || F <- Followers],
     ok = enqueue(Follower1, msg2),
-    ok = enqueue(Follower1, msg3),
-    ok = enqueue(Follower1, msg4),
+    ok = enqueue(Follower2, msg3),
     %% start another new member
     ok = ra:start_server(?SYS, Conf5),
     {ok, _, _Leader2} = ra:add_confirm_member(Follower1, ServerId5, 1_000),
     %% restart original leader that has S4 as a new member in their logs
     ra:restart_server(?SYS, Leader1),
-    ok = timer:sleep(100),
+    ok = enqueue(Leader1, msg4),
     %% it should have abandoned this cluster change, diverged from the new leader
-    {ok, Members1, _Leader3} = ra:members(Leader1),
-    Members1 = lists:sort([Leader1, Follower1, Follower2, ServerId5]),
-    %% confirmed removeal of F2
+    ok = ra_lib:retry(fun() ->
+                          {ok, Members1, Leader1} = ra:members({local, Leader1}),
+                          Members1 =:= lists:sort([Leader1, Follower1, Follower2, ServerId5])
+                      end, 5, 1_000),
+    %% confirmed removal of F2
     ra:stop_server(?SYS, Follower2),
-    ok = timer:sleep(100),
+    %% wait cluster readiness before membership changes
+    {ok, ready, Leader4} = ra:consistent_query(Follower1, fun(_) -> ready end, 5_000),
     {ok, _, Leader4} = ra:remove_confirm_member(Follower1, Follower2, 1_000),
     {ok, Members2, Leader4} = ra:members(Leader4),
     Members2 = lists:sort([Leader1, Follower1, ServerId5]),

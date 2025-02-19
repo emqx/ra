@@ -2846,14 +2846,16 @@ append_machine_effects(AppEffs, Effs) ->
     [AppEffs | Effs].
 
 cluster_scan_fun({Idx, Term, {'$ra_cluster_change', _Meta, NewCluster, _}},
-                 State0) ->
+                 #{cluster := PrevCluster,
+                   cluster_index_term := {PrevCITIdx, PrevCITTerm}} = State0) ->
     ?DEBUG("~ts: ~ts: applying ra cluster change to ~w",
            [log_id(State0), ?FUNCTION_NAME, maps:keys(NewCluster)]),
     %% we are recovering and should apply the cluster change
     State0#{cluster => NewCluster,
             membership => get_membership(NewCluster, State0),
             cluster_change_permitted => true,
-            cluster_index_term => {Idx, Term}};
+            cluster_index_term => {Idx, Term},
+            previous_cluster => {PrevCITIdx, PrevCITTerm, PrevCluster}};
 cluster_scan_fun(_Cmd, State) ->
     State.
 
