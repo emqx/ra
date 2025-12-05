@@ -140,7 +140,9 @@ handle_cast({mem_tables, Ranges, WalFile}, #state{data_dir = Dir,
     T1 = erlang:monotonic_time(),
     ok = counters:add(State#state.counter, ?C_MEM_TABLES, map_size(Ranges)),
     #{names := Names} = ra_system:fetch(System),
-    Degree = erlang:system_info(schedulers),
+    %% occupy no more than half of dirty IO schedulers
+    %% should be made configurable
+    Degree = erlang:max(1, erlang:system_info(dirty_io_schedulers) div 2),
     %% TODO: refactor to make better use of time where each uid has an
     %% uneven amount of work to do.
     RangesList = maps:fold(
