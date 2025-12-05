@@ -597,7 +597,7 @@ roll_over(#state{wal = Wal0, file_num = Num0,
 
 open_wal(File, Max, #conf{write_strategy = o_sync} = Conf) ->
         Modes = [sync | ?FILE_MODES],
-        case prepare_file(File, Modes) of
+        case prepare_file(File, Modes, Conf) of
             {ok, Fd} ->
                 % many platforms implement O_SYNC a bit like O_DSYNC
                 % perform a manual sync here to ensure metadata is flushed
@@ -610,32 +610,20 @@ open_wal(File, Max, #conf{write_strategy = o_sync} = Conf) ->
                 open_wal(File, Max, Conf#conf{write_strategy = default})
         end;
 open_wal(File, Max, #conf{} = Conf0) ->
-    {ok, Fd} = prepare_file(File, ?FILE_MODES),
+    {ok, Fd} = prepare_file(File, ?FILE_MODES, Conf0),
     Conf = maybe_pre_allocate(Conf0, Fd, Max),
     {Conf, #wal{fd = Fd,
                 max_size = Max,
                 filename = File}}.
 
-prepare_file(File, Modes) ->
-    Tmp = make_tmp(File),
-    %% rename is atomic-ish so we will never accidentally write an empty wal file
-    %% using prim_file here as file:rename/2 uses the file server
-    ok = prim_file:rename(Tmp, File),
-    case file:open(File, Modes) of
-        {ok, Fd2} ->
-            {ok, ?HEADER_SIZE} = file:position(Fd2, ?HEADER_SIZE),
-            {ok, Fd2};
-        {error, _} = Err ->
-            Err
-    end.
-
-make_tmp(File) ->
-    Tmp = filename:rootname(File) ++ ".tmp",
-    {ok, Fd} = file:open(Tmp, [write, binary, raw]),
+prepare_file(File, Modes, #conf{sync_method = SyncMethod}) ->
+    {ok, Fd} = file:open(File, Modes),
     ok = file:write(Fd, <<?MAGIC, ?CURRENT_VERSION:8/unsigned>>),
-    ok = ra_file:sync(Fd),
-    ok = file:close(Fd),
-    Tmp.
+    case SyncMethod of
+        none -> ok;
+        _Sync -> ok = ra_file:sync(Fd)
+    end,
+    {ok, Fd}.
 
 maybe_pre_allocate(#conf{pre_allocate = true,
                          write_strategy = Strat} = Conf, Fd, Max0)
@@ -746,7 +734,11 @@ open_at_first_record(File) ->
             %% the only version currently supported
             Fd;
         {ok, <<Magic:4/binary, UnknownVersion:8/unsigned>>} ->
-            exit({unknown_wal_file_format, Magic, UnknownVersion})
+            exit({unknown_wal_file_format, Magic, UnknownVersion});
+        eof ->
+            %% WAL was likely written with sync_method = none
+            ?WARN("wal: skipping recovery of ~ts - empty file", [File]),
+            Fd
     end.
 
 close_existing(Fd) ->

@@ -52,6 +52,7 @@ all_tests() ->
      roll_over_with_data_larger_than_max_size,
      roll_over_entry_limit,
      recover_empty,
+     recover_zero_sized,
      recover_with_last_entry_corruption,
      recover_with_last_entry_corruption_pre_allocate,
      checksum_failure_in_middle_of_file_should_fail,
@@ -1194,6 +1195,43 @@ recover_empty(Config) ->
     proc_lib:stop(ra_log_wal),
     {ok, Pid} = ra_log_wal:start_link(Conf),
     proc_lib:stop(Pid),
+    meck:unload(),
+    ok.
+
+recover_zero_sized(Config) ->
+    ok = logger:set_primary_config(level, all),
+    Conf0 = #{dir := Dir} = ?config(wal_conf, Config),
+    Conf = Conf0#{segment_writer => self()},
+    meck:new(ra_log_segment_writer, [passthrough]),
+    meck:expect(ra_log_segment_writer, await,
+                fun(_) -> ok end),
+    {ok, _} = ra_log_wal:start_link(Conf),
+    proc_lib:stop(ra_log_wal),
+
+    %% Truncate WAL file:
+    [WalFile] = filelib:wildcard(filename:join(Dir, "*.wal")),
+    {ok, Fd} = file:open(WalFile, [raw, binary, write]),
+    ok = file:truncate(Fd),
+    ok = file:close(Fd),
+
+    {UId, _} = WriterId = ?config(writer_id, Config),
+    Tid = ets:new(?FUNCTION_NAME, []),
+
+    %% Recovery works as usual, WAL is fully functional:
+    {ok, _} = ra_log_wal:start_link(Conf),
+    [{ok, _} = ra_log_wal:write(ra_log_wal, WriterId, Tid, Idx, 1, <<"data">>)
+     || Idx <- lists:seq(1, 100)],
+    _ = await_written(WriterId, 1, {1, 100}),
+    empty_mailbox(),
+    proc_lib:stop(ra_log_wal),
+
+    {ok, Pid} = ra_log_wal:start_link(Conf),
+    ?assert(erlang:is_process_alive(Pid)),
+    {ok, Mt} = ra_log_ets:mem_table_please(?config(names, Config), UId),
+    ?assertMatch({1, 100}, ra_mt:range(Mt)),
+    empty_mailbox(),
+    proc_lib:stop(Pid),
+
     meck:unload(),
     ok.
 
