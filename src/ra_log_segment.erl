@@ -177,7 +177,8 @@ process_file(false, Mode, Filename, Fd, Options) ->
     MaxSize = maps:get(max_size, Options, ?SEGMENT_MAX_SIZE_B),
     ComputeChecksums = maps:get(compute_checksums, Options, true),
     IndexSize = MaxCount * ?INDEX_RECORD_SIZE_V2,
-    ok = write_header(MaxCount, Fd),
+    SyncMethod = maps:get(sync_method, Options, datasync),
+    ok = write_header(MaxCount, Fd, SyncMethod),
     FileAdvise = maps:get(file_advise, Options, dont_need),
     {ok, #state{cfg = #cfg{version = ?VERSION,
                            max_count = MaxCount,
@@ -248,6 +249,9 @@ append(State, Index, Term, Data)
 -spec sync(state()) -> {ok, state()} | {error, term()}.
 sync(#state{cfg = #cfg{fd = Fd},
             pending_index = []} = State) ->
+    %% note: disregarding sync_method chosen by the user
+    %% important to fsync here because, as a safety measure: once segments are
+    %% written and closed WAL is going to be deleted
     case ra_file:sync(Fd) of
         ok ->
             {ok, State};
@@ -597,11 +601,18 @@ parse_index_data_v1(<<Idx:64/unsigned, Term:64/unsigned,
                      update_range(Range, Idx),
                      Index#{Idx => {Term, Offset, Length, Crc}}).
 
-write_header(MaxCount, Fd) ->
+write_header(MaxCount, Fd, SyncMethod) ->
     Header = <<?MAGIC, ?VERSION:16/unsigned, MaxCount:16/unsigned>>,
     {ok, 0} = file:position(Fd, 0),
     ok = file:write(Fd, Header),
-    ok = ra_file:sync(Fd).
+    case SyncMethod of
+        none ->
+            %% risk of getting `missing_segment_header` after a crash-restart
+            %% see also: ra_log_segment_writer:open_file/2
+            ok;
+        _Sync ->
+            ok = ra_file:sync(Fd)
+    end.
 
 read_header(Fd) ->
     case file:pread(Fd, 0, ?HEADER_SIZE) of
