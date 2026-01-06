@@ -622,6 +622,7 @@ roll_over(#state{wal = Wal0, file_num = Num0,
                            MaxBytes
                    end,
     {Conf, Wal} = open_wal(NextFile, NextMaxBytes, Conf0),
+    ok = ra_lib:sync_dir(Dir),
     State0#state{conf = Conf,
                  wal = Wal,
                  file_num = Num}.
