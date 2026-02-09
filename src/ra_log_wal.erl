@@ -353,7 +353,8 @@ handle_op({info, {'EXIT', _, Reason}}, _State) ->
     %% this is here for testing purposes only
     throw({stop, Reason}).
 
-recover_wal(Dir, #conf{segment_writer = SegWriter,
+recover_wal(Dir, #conf{names = Names,
+                       segment_writer = SegWriter,
                        mem_tables_tid = MemTblsTid} = Conf) ->
     % ensure configured directory exists
     ok = ra_lib:make_dir(Dir),
@@ -377,25 +378,30 @@ recover_wal(Dir, #conf{segment_writer = SegWriter,
              end || File <- Files0,
                     filename:extension(File) == ".wal"],
     WalFiles = lists:sort(Files),
-    AllWriters =
-        [begin
+
+    %% Seed writers from existing segment files so that we know the last
+    %% flushed index per writer. This prevents accepting WAL entries that
+    %% would create holes relative to segment state.
+    Registered = ra_directory:list_registered(Names),
+    SegWriters = seed_writers_from_segments(SegWriter, Registered),
+
+    FinalWriters = lists:foldl(
+        fun (F, AccWriters) ->
              ?DEBUG("wal: recovering ~ts, Mode ~s", [F, Mode]),
              Fd = open_at_first_record(filename:join(Dir, F)),
              {Time, #recovery{ranges = Ranges,
                               writers = Writers}} =
-                 timer:tc(fun () -> recover_wal_chunks(Conf, Fd, Mode) end),
+                 timer:tc(fun () ->
+                                recover_wal_chunks(Conf, Fd, Mode, SegWriters)
+                          end),
 
              ok = ra_log_segment_writer:accept_mem_tables(SegWriter, Ranges, F),
 
              close_existing(Fd),
              ?DEBUG("wal: recovered ~ts time taken ~bms - recovered ~b writers",
                     [F, Time div 1000, map_size(Writers)]),
-             Writers
-         end || F <- WalFiles],
-
-    FinalWriters = lists:foldl(fun (New, Acc) ->
-                                       maps:merge(Acc, New)
-                               end, #{}, AllWriters),
+            maps:merge(AccWriters, Writers)
+        end, SegWriters, WalFiles),
 
     ?DEBUG("wal: recovered ~b writers", [map_size(FinalWriters)]),
 
@@ -795,9 +801,10 @@ dump_records(<<_:1/unsigned, 1:1/unsigned, _:22/unsigned,
 dump_records(<<>>, Entries) ->
     Entries.
 
-recover_wal_chunks(#conf{} = Conf, Fd, Mode) ->
+recover_wal_chunks(#conf{} = Conf, Fd, Mode, Writers0) ->
     Chunk = read_wal_chunk(Fd, Conf#conf.recovery_chunk_size),
-    recover_records(Conf, Fd, Chunk, #{}, #recovery{mode = Mode}).
+    recover_records(Conf, Fd, Chunk, #{},
+                    #recovery{mode = Mode, writers = Writers0}).
 % All zeros indicates end of a pre-allocated wal file
 recover_records(_, _Fd, <<0:1/unsigned, 0:1/unsigned, 0:22/unsigned,
                           IdDataLen:16/unsigned, _:IdDataLen/binary,
@@ -820,14 +827,21 @@ recover_records(#conf{names = Names} = Conf, Fd,
             SnapIdx = recover_snap_idx(Conf, UId, Trunc == 1, Idx),
             case validate_checksum(Checksum, Idx, Term, EntryData) of
                 ok when Idx > SnapIdx ->
-                    State1 = handle_trunc(Trunc == 1, UId, Idx, State0),
-                    case recover_entry(Names, UId,
-                                       {Idx, Term, binary_to_term(EntryData)},
-                                       SnapIdx, State1) of
-                        {ok, State} ->
-                            recover_records(Conf, Fd, Rest, Cache, State);
-                        {retry, State} ->
-                            recover_records(Conf, Fd, Chunk, Cache, State)
+                    case Trunc == 1 orelse is_recovery_contiguous(UId, Idx, State0) of
+                        true ->
+                            State1 = handle_trunc(Trunc == 1, UId, Idx, State0),
+                            case recover_entry(Names, UId,
+                                               {Idx, Term, binary_to_term(EntryData)},
+                                               SnapIdx, State1) of
+                                {ok, State} ->
+                                    recover_records(Conf, Fd, Rest, Cache, State);
+                                {retry, State} ->
+                                    recover_records(Conf, Fd, Chunk, Cache, State)
+                            end;
+                        false ->
+                            ?WARN("wal: skipping non-contiguous entry ~b for ~s "
+                                  "during recovery", [Idx, UId]),
+                            recover_records(Conf, Fd, Rest, Cache, State0)
                     end;
                 ok ->
                     %% best the the snapshot index as the last
@@ -864,14 +878,21 @@ recover_records(#conf{names = Names} = Conf, Fd,
             SnapIdx = recover_snap_idx(Conf, UId, Trunc == 1, Idx),
             case validate_checksum(Checksum, Idx, Term, EntryData) of
                 ok when Idx > SnapIdx ->
-                    State1 = handle_trunc(Trunc == 1, UId, Idx, State0),
-                    case recover_entry(Names, UId,
-                                       {Idx, Term, binary_to_term(EntryData)},
-                                       SnapIdx, State1) of
-                        {ok, State} ->
-                            recover_records(Conf, Fd, Rest, Cache, State);
-                        {retry, State} ->
-                            recover_records(Conf, Fd, Chunk, Cache, State)
+                    case Trunc == 1 orelse is_recovery_contiguous(UId, Idx, State0) of
+                        true ->
+                            State1 = handle_trunc(Trunc == 1, UId, Idx, State0),
+                            case recover_entry(Names, UId,
+                                               {Idx, Term, binary_to_term(EntryData)},
+                                               SnapIdx, State1) of
+                                {ok, State} ->
+                                    recover_records(Conf, Fd, Rest, Cache, State);
+                                {retry, State} ->
+                                    recover_records(Conf, Fd, Chunk, Cache, State)
+                            end;
+                        false ->
+                            ?WARN("wal: skipping non-contiguous entry ~b for ~s "
+                                  "during recovery", [Idx, UId]),
+                            recover_records(Conf, Fd, Rest, Cache, State0)
                     end;
                 ok ->
                     recover_records(Conf, Fd, Rest, Cache, State0);
@@ -899,6 +920,16 @@ recover_records(Conf, Fd, Chunk, Cache, State) ->
             %% append this chunk to the remainder of the last chunk
             Chunk0 = <<Chunk/binary, NextChunk/binary>>,
             recover_records(Conf, Fd, Chunk0, Cache, State)
+    end.
+
+is_recovery_contiguous(UId, Idx, #recovery{writers = Writers}) ->
+    case Writers of
+        #{UId := {_, LastIdx}} ->
+            Idx =< LastIdx + 1;
+        _ ->
+            %% First entry for this writer in recovery (not seeded from
+            %% segments either). Accept unconditionally.
+            true
     end.
 
 recover_snap_idx(Conf, UId, Trunc, CurIdx) ->
@@ -1071,6 +1102,30 @@ handle_trunc(true, UId, Idx, #recovery{mode = Mode,
         _ ->
             State
     end.
+
+seed_writers_from_segments(SegWriter, Registered) ->
+    lists:foldl(
+      fun ({_Name, UId}, Acc) ->
+            case ra_log_segment_writer:my_segments(SegWriter, UId) of
+                [] ->
+                    Acc;
+                SegFiles ->
+                    Latest = lists:last(SegFiles),
+                    case ra_log_segment:open(Latest, #{mode => read}) of
+                        {ok, Seg} ->
+                            Range = ra_log_segment:range(Seg),
+                            ra_log_segment:close_dirty(Seg),
+                            case Range of
+                                {_First, Last} ->
+                                    Acc#{UId => {in_seq, Last}};
+                                _ ->
+                                    Acc
+                            end;
+                        _ ->
+                            Acc
+                    end
+            end
+      end, #{}, Registered).
 
 named_cast(To, Msg) when is_pid(To) ->
     gen_batch_server:cast(To, Msg),
