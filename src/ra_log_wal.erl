@@ -824,26 +824,9 @@ recover_records(#conf{names = Names} = Conf, Fd,
     case ra_directory:is_registered_uid(Names, UId) of
         true ->
             Cache = Cache0#{IdRef => {UId, <<1:1/unsigned, IdRef:22/unsigned>>}},
-            SnapIdx = recover_snap_idx(Conf, UId, Trunc == 1, Idx),
-            case validate_checksum(Checksum, Idx, Term, EntryData) of
-                ok when Idx > SnapIdx ->
-                    case Trunc == 1 orelse is_recovery_contiguous(UId, Idx, State0) of
-                        true ->
-                            State1 = handle_trunc(Trunc == 1, UId, Idx, State0),
-                            case recover_entry(Names, UId,
-                                               {Idx, Term, binary_to_term(EntryData)},
-                                               SnapIdx, State1) of
-                                {ok, State} ->
-                                    recover_records(Conf, Fd, Rest, Cache, State);
-                                {retry, State} ->
-                                    recover_records(Conf, Fd, Chunk, Cache, State)
-                            end;
-                        false ->
-                            ?WARN("wal: skipping non-contiguous entry ~b for ~s "
-                                  "during recovery", [Idx, UId]),
-                            recover_records(Conf, Fd, Rest, Cache, State0)
-                    end;
-                ok ->
+            case recover_record(Conf, UId, Idx, Term,
+                                EntryData, Checksum, Trunc == 1, State0) of
+                {next, {in_snapshot, SnapIdx}, State} ->
                     %% best the the snapshot index as the last
                     %% writer index
                     Writers = case State0#recovery.writers of
@@ -853,19 +836,19 @@ recover_records(#conf{names = Names} = Conf, Fd,
                                       W#{UId => {in_seq, SnapIdx}}
                               end,
                     recover_records(Conf, Fd, Rest, Cache,
-                                    State0#recovery{writers = Writers});
-                error ->
-                    ?DEBUG("WAL: record failed CRC check. If this is the last record"
-                           " recovery can resume", []),
-                    %% if this is the last entry in the wal we can just drop the
-                    %% record;
+                                   State#recovery{writers = Writers});
+                {next, _, State} ->
+                    recover_records(Conf, Fd, Rest, Cache, State);
+                {retry, State} ->
+                    recover_records(Conf, Fd, Chunk, Cache, State);
+                {stop, State} ->
                     ok = is_last_record(Fd, Rest),
-                    State0
+                    State
             end;
         false ->
             recover_records(Conf, Fd, Rest, Cache0, State0)
     end;
-recover_records(#conf{names = Names} = Conf, Fd,
+recover_records(Conf, Fd,
                 <<Trunc:1/unsigned, 1:1/unsigned, IdRef:22/unsigned,
                   Checksum:32/integer,
                   EntryDataLen:32/unsigned,
@@ -875,34 +858,15 @@ recover_records(#conf{names = Names} = Conf, Fd,
                 Cache, State0) ->
     case Cache of
         #{IdRef := {UId, _}} ->
-            SnapIdx = recover_snap_idx(Conf, UId, Trunc == 1, Idx),
-            case validate_checksum(Checksum, Idx, Term, EntryData) of
-                ok when Idx > SnapIdx ->
-                    case Trunc == 1 orelse is_recovery_contiguous(UId, Idx, State0) of
-                        true ->
-                            State1 = handle_trunc(Trunc == 1, UId, Idx, State0),
-                            case recover_entry(Names, UId,
-                                               {Idx, Term, binary_to_term(EntryData)},
-                                               SnapIdx, State1) of
-                                {ok, State} ->
-                                    recover_records(Conf, Fd, Rest, Cache, State);
-                                {retry, State} ->
-                                    recover_records(Conf, Fd, Chunk, Cache, State)
-                            end;
-                        false ->
-                            ?WARN("wal: skipping non-contiguous entry ~b for ~s "
-                                  "during recovery", [Idx, UId]),
-                            recover_records(Conf, Fd, Rest, Cache, State0)
-                    end;
-                ok ->
-                    recover_records(Conf, Fd, Rest, Cache, State0);
-                error ->
-                    ?DEBUG("WAL: record failed CRC check. If this is the last record"
-                           " recovery can resume", []),
-                    %% if this is the last entry in the wal we can just drop the
-                    %% record;
+            case recover_record(Conf, UId, Idx, Term,
+                                EntryData, Checksum, Trunc == 1, State0) of
+                {next, _, State} ->
+                    recover_records(Conf, Fd, Rest, Cache, State);
+                {retry, State} ->
+                    recover_records(Conf, Fd, Chunk, Cache, State);
+                {stop, State} ->
                     ok = is_last_record(Fd, Rest),
-                    State0
+                    State
             end;
         _ ->
             %% if the IdRef is not in the cache this refers to a deleted
@@ -920,6 +884,35 @@ recover_records(Conf, Fd, Chunk, Cache, State) ->
             %% append this chunk to the remainder of the last chunk
             Chunk0 = <<Chunk/binary, NextChunk/binary>>,
             recover_records(Conf, Fd, Chunk0, Cache, State)
+    end.
+
+recover_record(#conf{names = Names} = Conf,
+                   UId, Idx, Term, EntryData, Checksum, IsTrunc, State0) ->
+    SnapIdx = recover_snap_idx(Conf, UId, IsTrunc, Idx),
+    case validate_checksum(Checksum, Idx, Term, EntryData) of
+        ok when Idx > SnapIdx ->
+            case IsTrunc orelse is_recovery_contiguous(UId, Idx, State0) of
+                true ->
+                    State1 = handle_trunc(IsTrunc, UId, Idx, State0),
+                    case recover_entry(Names, UId,
+                                       {Idx, Term, binary_to_term(EntryData)},
+                                       SnapIdx, State1) of
+                        {ok, State} ->
+                            {next, ok, State};
+                        {retry, State} ->
+                            {retry, State}
+                    end;
+                false ->
+                    ?WARN("wal: skipping non-contiguous entry ~b for ~s "
+                          "during recovery", [Idx, UId]),
+                    {next, skipped, State0}
+            end;
+        ok ->
+            {next, {in_snapshot, SnapIdx}, State0};
+        error ->
+            ?DEBUG("WAL: record failed CRC check. If this is the last record"
+                   " recovery can resume", []),
+            {stop, State0}
     end.
 
 is_recovery_contiguous(UId, Idx, #recovery{writers = Writers}) ->
