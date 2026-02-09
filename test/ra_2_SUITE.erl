@@ -210,16 +210,13 @@ force_deleted_server_mem_tables_are_cleaned_up(Config) ->
                  wal := Wal,
                  segment_writer := SegWriter}} = ra_system:fetch(?SYS),
 
-    [{_, Tid}] = ets:lookup(OpnMemTbls, UId),
+    %% NOTE
+    %% Calling `force_delete_server/2` now drops mem tables immediately.
+    [] = ets:lookup(OpnMemTbls, UId),
     % force roll over after
     ok = ra_log_wal:force_roll_over(Wal),
     timer:sleep(100),
-    ra_log_segment_writer:await(SegWriter),
-
-    %% validate there are no mem tables for this server anymore
-    ?assertMatch(undefined, ets:info(Tid)),
-
-    ok.
+    ok = ra_log_segment_writer:await(SegWriter).
 
 leave_and_delete_server(Config) ->
     ok = logger:set_primary_config(level, all),
