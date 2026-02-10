@@ -392,7 +392,7 @@ recover_wal(Dir, #conf{names = Names,
              {Time, #recovery{ranges = Ranges,
                               writers = Writers}} =
                  timer:tc(fun () ->
-                                recover_wal_chunks(Conf, Fd, Mode, SegWriters)
+                                recover_wal_chunks(Conf, Fd, Mode, AccWriters)
                           end),
 
              ok = ra_log_segment_writer:accept_mem_tables(SegWriter, Ranges, F),
