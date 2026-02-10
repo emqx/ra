@@ -111,7 +111,8 @@
                    ranges = #{} :: #{ra_uid() =>
                                      [{ets:tid(), {ra:index(), ra:index()}}]},
                    tables = #{} :: #{ra_uid() => ra_mt:state()},
-                   writers = #{} :: #{ra_uid() => {in_seq, ra:index()}}
+                   writers = #{} :: #{ra_uid() => {in_seq, ra:index()}},
+                   skipped = #{} :: #{ra_uid() => ra_range:range()}
                   }).
 -record(state, {conf = #conf{},
                 file_num = 0 :: non_neg_integer(),
@@ -390,10 +391,17 @@ recover_wal(Dir, #conf{names = Names,
              ?DEBUG("wal: recovering ~ts, Mode ~s", [F, Mode]),
              Fd = open_at_first_record(filename:join(Dir, F)),
              {Time, #recovery{ranges = Ranges,
-                              writers = Writers}} =
+                              writers = Writers,
+                              skipped = Skipped}} =
                  timer:tc(fun () ->
                                 recover_wal_chunks(Conf, Fd, Mode, AccWriters)
                           end),
+
+                 map_size(Skipped) > 0 andalso maps:foreach(
+                    fun(UId, SkippedRanges) ->
+                            ?WARN("wal: skipped non-contiguous ranges ~p for ~s",
+                                  [SkippedRanges, UId])
+                    end, Skipped),
 
              ok = ra_log_segment_writer:accept_mem_tables(SegWriter, Ranges, F),
 
@@ -514,7 +522,7 @@ handle_msg({append, {UId, Pid} = Id, MtTid, Idx, Term, Entry},
         {ok, {in_seq, PrevIdx}} ->
             % writer was in seq but has sent an out of seq entry
             % notify writer
-            ?DEBUG("WAL: requesting resend from `~w`, "
+            ?DEBUG("WAL: requesting resend from ~s, "
                    "last idx ~b idx received ~b",
                    [UId, PrevIdx, Idx]),
             Pid ! {ra_log_event, {resend_write, PrevIdx + 1}},
@@ -905,9 +913,8 @@ recover_record(#conf{names = Names} = Conf,
                             {retry, State}
                     end;
                 false ->
-                    ?WARN("wal: skipping non-contiguous entry ~b for ~s "
-                          "during recovery", [Idx, UId]),
-                    {next, skipped, State0}
+                    Skipped = accumulate_skip(UId, Idx, State0#recovery.skipped),
+                    {next, skipped, State0#recovery{skipped = Skipped}}
             end;
         ok ->
             {next, {in_snapshot, SnapIdx}, State0};
@@ -926,6 +933,18 @@ is_recovery_contiguous(UId, Idx, #recovery{writers = Writers}) ->
             %% segments either). Accept unconditionally.
             true
     end.
+
+accumulate_skip(UId, Idx, Skipped) ->
+    UIdSkips0 = maps:get(UId, Skipped, []),
+    UIdSkips = case UIdSkips0 of
+        [{First, Last} | Rest] when Idx == Last + 1 ->
+            [{First, Idx} | Rest];
+        [_Range | _Rest] ->
+            [{Idx, Idx} | UIdSkips0];
+        [] ->
+            [{Idx, Idx}]
+    end,
+    Skipped#{UId => UIdSkips}.
 
 recover_snap_idx(Conf, UId, Trunc, CurIdx) ->
     case Trunc of
