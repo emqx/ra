@@ -3107,7 +3107,7 @@ append_log_leader(Cmd, #{log := Log0, current_term := Term} = State, Effects) ->
 
 pre_append_log_follower({Idx, Term, Cmd} = Entry,
                         State = #{cluster_index_term := {Idx, CITTerm},
-                                  id := Id})
+                                  cfg := #cfg{id = Id}})
   when Term /= CITTerm ->
     % the index for the cluster config entry has a different term, i.e.
     % it has been overwritten by a new leader. Unless it is another cluster
