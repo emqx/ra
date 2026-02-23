@@ -276,11 +276,17 @@ init(#{uid := UId,
                                LI ->
                                    fetch_term(LI, State0)
                            end,
+    MtIdx0 = case MtRange of
+                 undefined -> undefined;
+                 {FI, _} -> FI
+             end,
     LastSegRefIdx = case SegRefs of
                         [] ->
                             -1;
+                        [{{_, L}, _} | _] when MtIdx0 =:= undefined ->
+                            L;
                         [{{_, L}, _} | _] ->
-                            L
+                            min(L, MtIdx0 - 1)
                     end,
     LastWrittenIdx = case ra_log_wal:last_writer_seq(Wal, UId) of
                          {ok, undefined} ->
