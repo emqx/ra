@@ -516,7 +516,7 @@ leader(EventType, {aux_command, Cmd}, State0) ->
     {State, Actions} =
         ?HANDLE_EFFECTS(Effects, EventType,
                         State0#state{server_state = ServerState}),
-    {keep_state, State#state{server_state = ServerState}, Actions};
+    {keep_state, State, Actions};
 leader(EventType, flush_commands,
        #state{conf = #conf{flush_commands_size = Size},
               low_priority_commands = Delayed0} = State0) ->
@@ -644,7 +644,7 @@ candidate(EventType, {aux_command, Cmd}, State0) ->
     {State, Actions} =
         ?HANDLE_EFFECTS(Effects, EventType,
                         State0#state{server_state = ServerState}),
-    {keep_state, State#state{server_state = ServerState}, Actions};
+    {keep_state, State, Actions};
 candidate({call, From}, ping, State) ->
     {keep_state, State, [{reply, From, {pong, candidate}}]};
 candidate(info, {'DOWN', _MRef, process, Pid, Info}, State0) ->
@@ -705,7 +705,7 @@ pre_vote(EventType, {aux_command, Cmd}, State0) ->
     {State, Actions} =
         ?HANDLE_EFFECTS(Effects, EventType,
                         State0#state{server_state = ServerState}),
-    {keep_state, State#state{server_state = ServerState}, Actions};
+    {keep_state, State, Actions};
 pre_vote({call, From}, ping, State) ->
     {keep_state, State, [{reply, From, {pong, pre_vote}}]};
 pre_vote(info, {node_event, _Node, _Evt}, State) ->
@@ -795,7 +795,7 @@ follower(EventType, {aux_command, Cmd}, State0) ->
     {State, Actions} =
         ?HANDLE_EFFECTS(Effects, EventType,
                         State0#state{server_state = ServerState}),
-    {keep_state, State#state{server_state = ServerState}, Actions};
+    {keep_state, State, Actions};
 follower({call, From}, trigger_election, State) ->
     ?DEBUG("~ts: election triggered by ~w", [log_id(State), element(1, From)]),
     {keep_state, State, [{reply, From, ok},
@@ -921,7 +921,7 @@ receive_snapshot(EventType, {aux_command, Cmd}, State0) ->
     {State, Actions} =
         ?HANDLE_EFFECTS(Effects, EventType,
                         State0#state{server_state = ServerState}),
-    {keep_state, State#state{server_state = ServerState}, Actions};
+    {keep_state, State, Actions};
 receive_snapshot(EventType, Msg, State0) ->
     case handle_receive_snapshot(Msg, State0) of
         {receive_snapshot, State1, Effects} ->
@@ -1022,7 +1022,7 @@ await_condition(EventType, {aux_command, Cmd}, State0) ->
     {State, Actions} =
         ?HANDLE_EFFECTS(Effects, EventType,
                         State0#state{server_state = ServerState}),
-    {keep_state, State#state{server_state = ServerState}, Actions};
+    {keep_state, State, Actions};
 await_condition({call, From}, ping, State) ->
     {keep_state, State, [{reply, From, {pong, await_condition}}]};
 await_condition({call, From}, trigger_election, State) ->
