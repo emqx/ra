@@ -206,9 +206,7 @@ handle_cast({truncate_segments, Who, {_Range, Name} = SegRef},
                 {ok, Seg} ->
                     case ra_log_segment:segref(Seg) of
                         SegRef ->
-                            _ = ra_log_segment:close(Seg),
                             %% it has not changed - we can delete that too
-                            _ = prim_file:delete(Pivot),
                             %% as we are deleting the last segment - create an empty
                             %% successor
                             T2 = erlang:monotonic_time(),
@@ -217,11 +215,13 @@ handle_cast({truncate_segments, Who, {_Range, Name} = SegRef},
                             ?DEBUG("segment_writer in '~w': ~s for ~s took ~bms",
                                    [System, ?FUNCTION_NAME, Who, Diff]),
                             case open_successor_segment(Seg, SegConf) of
-                                undefined ->
+                                enoent ->
+                                    _ = prim_file:delete(Pivot),
                                     %% directory must have been deleted after the pivot
                                     %% segment was opened
                                     {noreply, State0};
                                 Succ ->
+                                    _ = prim_file:delete(Pivot),
                                     _ = ra_log_segment:close(Succ),
                                     {noreply, State0}
                             end;
@@ -346,7 +346,7 @@ flush_mem_table_range(ServerUId, {Tid, {StartIdx0, EndIdx}},
                                       [SRef | ClosedSegRefs]
                               end,
 
-                    _ = ra_log_segment:close(Segment),
+                    ok = ra_log_segment:close(Segment),
                     _ = ra_lib:sync_dir(Dir),
                     SegRefs
             end
@@ -429,7 +429,7 @@ append_to_segment(UId, Tid, Idx, EndIdx, Seg0, Closed, State) ->
                 {error, full} ->
                     % close and open a new segment
                     case open_successor_segment(Seg0, State#state.segment_conf) of
-                        undefined ->
+                        enoent ->
                             %% a successor cannot be opened - this is most likely due
                             %% to the directory having been deleted.
                             undefined;
@@ -478,7 +478,7 @@ open_successor_segment(CurSeg, SegConf) ->
         {error, enoent} ->
             %% the directory has been deleted whilst segments were being
             %% written
-            undefined;
+            enoent;
         {ok, Seg} ->
             Seg
     end.

@@ -448,29 +448,35 @@ segref(#state{range = Range,
 segref(Filename) ->
     {ok, Seg} = open(Filename, #{mode => read}),
     SegRef = segref(Seg),
-    close(Seg),
+    _ = close(Seg),
     SegRef.
 
 -spec is_same_as(state(), file:filename_all()) -> boolean().
 is_same_as(#state{cfg = #cfg{filename = Fn0}}, Fn) ->
     is_same_filename_all(Fn0, Fn).
 
--spec close(state()) -> ok.
+-spec close(state()) -> ok | {error, term()}.
 close(#state{cfg = #cfg{fd = Fd,
                         mode = append,
-                        file_advise = FileAdvise}} = State) ->
-    % close needs to be defensive and idempotent so we ignore the return
-    % values here
-    _ = sync(State),
-    _ = case is_full(State) of
-            true ->
-                file:advise(Fd, 0, 0, FileAdvise);
-            false ->
-                ok
-        end,
-    _ = file:close(Fd),
-    ok;
+                        file_advise = FileAdvise}} = State0) ->
+    case sync(State0) of
+        {ok, State} ->
+            %% do not report errors from file:advise, it isn't necessary
+            case is_full(State) of
+                true ->
+                    _ = file:advise(Fd, 0, 0, FileAdvise),
+                    ok;
+                false ->
+                    ok
+            end,
+            _ = file:close(Fd),
+            ok;
+        Err ->
+            _ = file:close(Fd),
+            Err
+    end;
 close(#state{cfg = #cfg{fd = Fd}}) ->
+    %% ignore close errors when in read mode
     _ = file:close(Fd),
     ok.
 
@@ -530,7 +536,7 @@ dump(File, Fun) ->
     {Idx, Last} = range(S0),
     L = fold(S0, Idx, Last, Fun,
              fun (E, A) -> [E | A] end, []),
-    close(S0),
+    _ = close(S0),
     lists:reverse(L).
 
 
