@@ -22,6 +22,7 @@ all_tests() ->
      resend_write_after_tick,
      handle_overwrite,
      handle_overwrite_append,
+     follower_aer_stale_last_written,
      receive_segment,
      delete_during_segment_flush,
      read_one,
@@ -124,6 +125,30 @@ end_per_testcase(_, Config) ->
 -define(N1, {n1, node()}).
 -define(N2, {n2, node()}).
 % -define(N3, {n3, node()}).
+
+follower_aer_stale_last_written(Config) ->
+    Log0 = ra_log_init(Config),
+    {ok, Log1} = ra_log:write([{1, 1, "one"},
+                               {2, 1, "two"}], Log0),
+
+    %% process WAL write completion for 1 and 2
+    Log2 = receive
+               {ra_log_event, {written, 1, {1, 2}} = Evt} ->
+                   element(1, ra_log:handle_event(Evt, Log1))
+           after 2000 ->
+                     exit(written_timeout)
+           end,
+
+    %% verify last_written is 2
+    {2, 1} = ra_log:last_written(Log2),
+
+    %% Leader change, new leader sends entry 1 in term 2, truncating index 2
+    {ok, Log3} = ra_log:write([{1, 2, "new_one"}], Log2),
+
+    %% verify last_written is truncated to 0 since index 1 is not yet written
+    {0, 0} = ra_log:last_written(Log3),
+
+    ok.
 
 handle_overwrite(Config) ->
     Log0 = ra_log_init(Config),
