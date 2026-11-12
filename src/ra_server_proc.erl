@@ -916,6 +916,21 @@ receive_snapshot(EventType, {aux_command, Cmd}, State0) ->
         ?HANDLE_EFFECTS(Effects, EventType,
                         State0#state{server_state = ServerState}),
     {keep_state, State#state{server_state = ServerState}, Actions};
+receive_snapshot(info, {'DOWN', MRef, process, _Pid, Info},
+         #state{leader_monitor = MRef} = State0) ->
+    %% leader is down
+    ?INFO("~ts: receive_snapshot - Leader monitor down. Aborting snapshot receive. "
+          "Entering follower state.",
+          [log_id(State0)]),
+    %% See `follower/3` for reasons behind this distinction:
+    State1 = case Info of
+                 noconnection ->
+                     State0;
+                 _ ->
+                     clear_leader_id(State0)
+             end,
+    receive_snapshot(info, receive_snapshot_timeout,
+                     State1#state{leader_monitor = undefined});
 receive_snapshot(EventType, Msg, State0) ->
     case handle_receive_snapshot(Msg, State0) of
         {receive_snapshot, State1, Effects} ->
