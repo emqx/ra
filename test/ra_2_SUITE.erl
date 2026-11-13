@@ -46,7 +46,9 @@ all_tests() ->
      segment_writer_handles_server_deletion,
      %% TODO: mt decide on whether to support this
      % external_reader,
+     add_remove_confirm_member,
      add_member_without_quorum,
+     force_forget_lost_servers,
      force_start_follower_as_single_member,
      force_start_follower_as_single_member_nonvoter,
      force_start_nonvoter_as_single_member,
@@ -228,16 +230,13 @@ force_deleted_server_mem_tables_are_cleaned_up(Config) ->
                  wal := Wal,
                  segment_writer := SegWriter}} = ra_system:fetch(?SYS),
 
-    [{_, Tid}] = ets:lookup(OpnMemTbls, UId),
+    %% NOTE
+    %% Calling `force_delete_server/2` now drops mem tables immediately.
+    [] = ets:lookup(OpnMemTbls, UId),
     % force roll over after
     ok = ra_log_wal:force_roll_over(Wal),
     timer:sleep(100),
-    ra_log_segment_writer:await(SegWriter),
-
-    %% validate there are no mem tables for this server anymore
-    ?assertMatch(undefined, ets:info(Tid)),
-
-    ok.
+    ok = ra_log_segment_writer:await(SegWriter).
 
 leave_and_delete_server(Config) ->
     ok = logger:set_primary_config(level, all),
@@ -730,6 +729,102 @@ add_member_without_quorum(Config) ->
     {error, not_member} = ra:remove_member(InitialCluster, ServerId5),
     %%
     % timer:sleep(5000),
+    ok.
+
+add_remove_confirm_member(Config) ->
+    ok = logger:set_primary_config(level, all),
+    ClusterName = ?config(cluster_name, Config),
+    PrivDir = ?config(priv_dir, Config),
+    ServerId1 = ?config(server_id, Config),
+    ServerId2 = ?config(server_id2, Config),
+    ServerId3 = ?config(server_id3, Config),
+    ServerId4 = ?config(server_id4, Config),
+    ServerId5 = ?config(server_id5, Config),
+    InitialCluster = [ServerId1, ServerId2, ServerId3],
+    UId4 = ?config(uid4, Config),
+    UId5 = ?config(uid5, Config),
+    Conf4 = conf(ClusterName, UId4, ServerId4, PrivDir, [ServerId4]),
+    Conf5 = conf(ClusterName, UId5, ServerId5, PrivDir, [ServerId5]),
+    %% start cluster and find out who is the leader
+    ok = start_cluster(ClusterName, InitialCluster),
+    {ok, _, Leader1} = ra:members(hd(InitialCluster)),
+    ok = enqueue(Leader1, msg1),
+    %% stop followers
+    Followers = [Follower1, Follower2 | _] = InitialCluster -- [Leader1],
+    [ra:stop_server(?SYS, F) || F <- Followers],
+    %% start the new member
+    ok = ra:start_server(?SYS, Conf4),
+    %% the change won't be confirmed, because there's no quorum
+    {timeout, _} = ra:add_confirm_member(Leader1, ServerId4, 1_000),
+    {error, cluster_change_not_permitted} = ra:add_confirm_member(Leader1, ServerId4, 1_000),
+    %% stop the leader
+    ra:stop_server(?SYS, Leader1),
+    %% stop S4 so that it won't accidentally win leadership
+    ra:stop_server(?SYS, ServerId4),
+    %% instead start the followers
+    [ra:restart_server(?SYS, F) || F <- Followers],
+    ok = enqueue(Follower1, msg2),
+    ok = enqueue(Follower2, msg3),
+    %% start another new member
+    ok = ra:start_server(?SYS, Conf5),
+    {ok, _, _Leader2} = ra:add_confirm_member(Follower1, ServerId5, 1_000),
+    %% restart original leader that has S4 as a new member in their logs
+    ra:restart_server(?SYS, Leader1),
+    ok = enqueue(Leader1, msg4),
+    %% it should have abandoned this cluster change, diverged from the new leader
+    ok = ra_lib:retry(fun() ->
+                          {ok, Members1, Leader1} = ra:members({local, Leader1}),
+                          Members1 =:= lists:sort([Leader1, Follower1, Follower2, ServerId5])
+                      end, 5, 1_000),
+    %% confirmed removal of F2
+    ra:stop_server(?SYS, Follower2),
+    %% wait cluster readiness before membership changes
+    {ok, ready, Leader4} = ra:consistent_query(Follower1, fun(_) -> ready end, 5_000),
+    {ok, _, Leader4} = ra:remove_confirm_member(Follower1, Follower2, 1_000),
+    {ok, Members2, Leader4} = ra:members(Leader4),
+    Members2 = lists:sort([Leader1, Follower1, ServerId5]),
+    %% S4 should not be able to acquire leadership anymore
+    ra:restart_server(?SYS, ServerId4),
+    {timeout, _} = ra:members(ServerId4, 1_000),
+    ok.
+
+force_forget_lost_servers(Config) ->
+    ok = logger:set_primary_config(level, all),
+    %% ra:start_server should fail if the node already exists
+    ClusterName = ?config(cluster_name, Config),
+    ServerId1 = ?config(server_id, Config),
+    ServerId2 = ?config(server_id2, Config),
+    ServerId3 = ?config(server_id3, Config),
+    ServerId4 = ?config(server_id4, Config),
+    ServerId5 = ?config(server_id5, Config),
+    InitialCluster = [ServerId1, ServerId2, ServerId3, ServerId4, ServerId5],
+    ok = start_cluster(ClusterName, InitialCluster),
+    timer:sleep(100),
+    %% stop majority to simulate permanent outage
+    ok = ra:stop_server(?SYS, ServerId3),
+    ok = ra:stop_server(?SYS, ServerId4),
+    ok = ra:stop_server(?SYS, ServerId5),
+
+    timer:sleep(100),
+    %% forget most of the "lost" members
+    ok = ra_server_proc:force_forget_member(ServerId1, ServerId4, 1000),
+    ok = ra_server_proc:force_forget_member(ServerId1, ServerId5, 1000),
+    %% can't forget myself / already forgotten
+    {error, not_member} = ra_server_proc:force_forget_member(ServerId1, ServerId1, 1000),
+    {error, not_member} = ra_server_proc:force_forget_member(ServerId1, ServerId5, 1000),
+    %% should be able to acquire leadership now
+    {ok, [_, _, _], ServerId1} = ra:members(ServerId1),
+    timer:sleep(100),
+    %% and remove the last "lost" server
+    {ok, _IdxTerm, ServerId1} = ra:remove_member(ServerId1, ServerId3),
+    ok = enqueue(ServerId1, msg1),
+
+    %% test that it works after restart
+    ok = ra:stop_server(?SYS, ServerId1),
+    ok = ra:restart_server(?SYS, ServerId1),
+    {ok, [_, _], ServerId2} = ra:members(ServerId1),
+    ok = enqueue(ServerId1, msg2),
+
     ok.
 
 force_start_follower_as_single_member(Config) ->

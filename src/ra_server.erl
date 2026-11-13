@@ -566,14 +566,13 @@ handle_leader({PeerId, #append_entries_reply{success = false,
                           {Peer0#{match_index => PeerLastIdx,
                                   next_index => PeerLastIdx + 1}, Log1};
                       {EntryTerm, Log1} ->
-                          % last_index has a different term or entry does not
-                          % exist
+                          % last_index has a different term
                           % The peer must have uncommitted entries from a prior
                           % term that have now been overwritten by the current
                           % leader.
                           % Decrement next_index but don't go lower than
                           % match index.
-                          NextIndex = max(min(NI-1, PeerNextIdx), MI),
+                          NextIndex = max(min(NI-1, PeerLastIdx), MI + 1),
                           ?DEBUG("~ts: leader received last_index ~b"
                                  " from ~w with term ~b "
                                  "- expected term ~b. Setting "
@@ -933,6 +932,12 @@ handle_leader({transfer_leadership, ServerId},
 handle_leader({register_external_log_reader, Pid}, #{log := Log0} = State) ->
     {Log, Effs} = ra_log:register_reader(Pid, Log0),
     {leader, State#{log => Log}, Effs};
+handle_leader({force_forget_member, ServerId} = Event,
+              #{cfg := #cfg{id = Id}, cluster := Cluster} = State0)
+  when Id =/= ServerId, is_map_key(ServerId, Cluster) ->
+    {follower, State0#{votes => 0}, [{next_event, Event}]};
+handle_leader({force_forget_member, _ServerId}, State) ->
+    {leader, State, [{reply, {error, not_member}}]};
 handle_leader(force_member_change, State0) ->
     {follower, State0#{votes => 0}, [{next_event, force_member_change}]};
 handle_leader(Msg, State) ->
@@ -1025,7 +1030,7 @@ handle_candidate(#request_vote_rpc{}, State = #{current_term := Term}) ->
     Reply = #request_vote_result{term = Term, vote_granted = false},
     {candidate, State, [{reply, Reply}]};
 handle_candidate(#pre_vote_rpc{} = PreVote, State) ->
-    %% unlike request_vote_rpc, a candidate cannot simply reject 
+    %% unlike request_vote_rpc, a candidate cannot simply reject
     %% a pre_vote_rpc that does not have a higher term
     %% (see https://github.com/rabbitmq/ra/issues/439 for the detail)
     process_pre_vote(candidate, PreVote, State);
@@ -1035,6 +1040,25 @@ handle_candidate(#request_vote_result{}, State) ->
 handle_candidate(#pre_vote_result{}, State) ->
     %% handle to avoid logging as unhandled
     {candidate, State, []};
+handle_candidate(#install_snapshot_rpc{term = Term} = ISR,
+                 #{current_term := CurTerm,
+                   cfg := #cfg{log_id = LogId}} = State0)
+  when Term >= CurTerm ->
+    ?INFO("~ts: candidate received install_snapshot_rpc for term ~b,"
+          " stepping down from term ~b", [LogId, Term, CurTerm]),
+    {follower, State0#{votes => 0}, [{next_event, ISR}]};
+handle_candidate(#install_snapshot_rpc{term = Term,
+                                       meta = #{index := LastIndex,
+                                                 term := LastTerm}},
+                 #{cfg := #cfg{log_id = LogId},
+                   current_term := CurTerm} = State)
+  when Term < CurTerm ->
+    ?DEBUG("~ts: candidate install_snapshot old term ~b in ~b",
+          [LogId, LastIndex, LastTerm]),
+    Reply = #install_snapshot_result{term = CurTerm,
+                                     last_term = LastTerm,
+                                     last_index = LastIndex},
+    {candidate, State, [{reply, Reply}]};
 handle_candidate({ra_log_event, Evt}, State = #{log := Log0}) ->
     % simply forward all other events to ra_log
     {Log, Effects} = ra_log:handle_event(Evt, Log0),
@@ -1044,6 +1068,12 @@ handle_candidate(election_timeout, State) ->
 handle_candidate({register_external_log_reader, Pid}, #{log := Log0} = State) ->
     {Log, Effs} = ra_log:register_reader(Pid, Log0),
     {candidate, State#{log => Log}, Effs};
+handle_candidate({force_forget_member, ServerId} = Event,
+                 #{cfg := #cfg{id = Id}, cluster := Cluster} = State0)
+  when Id =/= ServerId, is_map_key(ServerId, Cluster) ->
+    {follower, State0#{votes => 0}, [{next_event, Event}]};
+handle_candidate({force_forget_member, _ServerId}, State) ->
+    {candidate, State, [{reply, {error, not_member}}]};
 handle_candidate(force_member_change, State0) ->
     {follower, State0#{votes => 0}, [{next_event, force_member_change}]};
 handle_candidate(#info_rpc{term = Term} = Msg,
@@ -1145,6 +1175,12 @@ handle_pre_vote({ra_log_event, Evt}, State = #{log := Log0}) ->
 handle_pre_vote({register_external_log_reader, Pid}, #{log := Log0} = State) ->
     {Log, Effs} = ra_log:register_reader(Pid, Log0),
     {pre_vote, State#{log => Log}, Effs};
+handle_pre_vote({force_forget_member, ServerId} = Event,
+                #{cfg := #cfg{id = Id}, cluster := Cluster} = State0)
+  when Id =/= ServerId, is_map_key(ServerId, Cluster) ->
+    {follower, State0#{votes => 0}, [{next_event, Event}]};
+handle_pre_vote({force_forget_member, _ServerId}, State) ->
+    {pre_vote, State, [{reply, {error, not_member}}]};
 handle_pre_vote(force_member_change, State0) ->
     {follower, State0#{votes => 0}, [{next_event, force_member_change}]};
 handle_pre_vote(#info_rpc{term = Term} = Msg,
@@ -1497,6 +1533,18 @@ handle_follower(try_become_leader, State) ->
 handle_follower({register_external_log_reader, Pid}, #{log := Log0} = State) ->
     {Log, Effs} = ra_log:register_reader(Pid, Log0),
     {follower, State#{log => Log}, Effs};
+handle_follower({force_forget_member, ServerId},
+                #{cfg := #cfg{id = Id, log_id = LogId},
+                  cluster := Cluster0} = State0)
+  when Id =/= ServerId, is_map_key(ServerId, Cluster0) ->
+    Cluster = maps:remove(ServerId, Cluster0),
+    ?WARN("~ts: Forcing cluster change to forget ~p. New cluster ~w",
+          [LogId, ServerId, Cluster]),
+    {ok, _, _, State, Effects} =
+        append_cluster_change(Cluster, undefined, no_reply, State0, []),
+    call_for_election(pre_vote, State, [{reply, ok} | Effects]);
+handle_follower({force_forget_member, _ServerId}, State) ->
+    {follower, State, [{reply, {error, not_member}}]};
 handle_follower(force_member_change,
                 #{cfg := #cfg{id = Id,
                               uid = Uid,
@@ -1673,11 +1721,31 @@ handle_receive_snapshot(#info_reply{term = Term} = Msg,
      [{next_event, Msg}]};
 handle_receive_snapshot(#info_reply{}, State) ->
     {receive_snapshot, State, []};
+%% Handle request_vote_rpc with higher term - abort snapshot and participate in election
+handle_receive_snapshot(#request_vote_rpc{term = Term} = Msg,
+                        #{current_term := CurTerm,
+                          cfg := #cfg{log_id = LogId},
+                          log := Log0} = State)
+  when Term > CurTerm ->
+    ?INFO("~ts: receive_snapshot saw request_vote_rpc for term ~b, "
+          "current term ~b, aborting snapshot receive",
+          [LogId, Term, CurTerm]),
+    SnapState0 = ra_log:snapshot_state(Log0),
+    SnapState = ra_snapshot:abort_accept(SnapState0),
+    Log = ra_log:set_snapshot_state(SnapState, Log0),
+    {follower, update_term(Term, clear_leader_id(State#{log => Log})),
+     [{next_event, Msg}]};
+%% Handle request_vote_rpc with lower or equal term - reject without aborting
+handle_receive_snapshot(#request_vote_rpc{},
+                        #{current_term := CurTerm} = State) ->
+    Reply = #request_vote_result{term = CurTerm, vote_granted = false},
+    {receive_snapshot, State, [{reply, Reply}]};
+%% Handle pre_vote_rpc without leaving receive_snapshot state
+handle_receive_snapshot(#pre_vote_rpc{} = PreVote, State) ->
+    process_pre_vote(receive_snapshot, PreVote, State);
 handle_receive_snapshot(Msg, State) ->
     log_unhandled_msg(receive_snapshot, Msg, State),
-    %% drop all other events??
-    %% TODO: work out what else to handle
-    {receive_snapshot, State, [{reply, {error, {unsupported_call, Msg}}}]}.
+    {receive_snapshot, State, []}.
 
 -spec handle_await_condition(ra_msg(), ra_server_state()) ->
     {ra_state(), ra_server_state(), effects()}.
@@ -2458,6 +2526,8 @@ process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
                                effective_machine_version = EffMacVer},
                    current_term := CurTerm} = State0)
   when Term >= CurTerm  ->
+    %% Pre-vote must not set voted_for (per Raft thesis Section 9.6),
+    %% but should still update current_term to retain the highest known term.
     State = update_term(Term, State0),
     LastIdxTerm = last_idx_term(State),
     case is_candidate_log_up_to_date(LLIdx, LLTerm, LastIdxTerm) of
@@ -2474,7 +2544,7 @@ process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
                    " for term ~b previous term ~b",
                    [log_id(State0), Cand, TheirMacVer, OurMacVer, EffMacVer,
                     {LLIdx, LLTerm}, Term, CurTerm]),
-            {FsmState, State#{voted_for => Cand},
+            {FsmState, State,
              [{reply, pre_vote_result(Term, Token, true)}]};
         true ->
             ?DEBUG("~ts: declining pre-vote for ~w their machine version ~b"
@@ -2816,14 +2886,16 @@ append_machine_effects(AppEffs, Effs) ->
     [AppEffs | Effs].
 
 cluster_scan_fun({Idx, Term, {'$ra_cluster_change', _Meta, NewCluster, _}},
-                 State0) ->
+                 #{cluster := PrevCluster,
+                   cluster_index_term := {PrevCITIdx, PrevCITTerm}} = State0) ->
     ?DEBUG("~ts: ~ts: applying ra cluster change to ~w",
            [log_id(State0), ?FUNCTION_NAME, maps:keys(NewCluster)]),
     %% we are recovering and should apply the cluster change
     State0#{cluster => NewCluster,
             membership => get_membership(NewCluster, State0),
             cluster_change_permitted => true,
-            cluster_index_term => {Idx, Term}};
+            cluster_index_term => {Idx, Term},
+            previous_cluster => {PrevCITIdx, PrevCITTerm, PrevCluster}};
 cluster_scan_fun(_Cmd, State) ->
     State.
 
@@ -3082,6 +3154,7 @@ pre_append_log_follower({Idx, Term, Cmd} = Entry,
             ?DEBUG("~ts: ~ts: follower applying ra cluster change to ~w",
                    [log_id(State), ?FUNCTION_NAME, maps:keys(Cluster)]),
             State#{cluster => Cluster,
+                   membership => get_membership(Cluster, State),
                    cluster_index_term => {Idx, Term}};
         _ ->
             % revert back to previous cluster
@@ -3089,16 +3162,19 @@ pre_append_log_follower({Idx, Term, Cmd} = Entry,
             ?DEBUG("~ts: ~ts: follower reverting cluster change to ~w",
                    [log_id(State), ?FUNCTION_NAME, maps:keys(PrevCluster)]),
             State1 = State#{cluster => PrevCluster,
+                            membership => get_membership(PrevCluster, State),
                             cluster_index_term => {PrevIdx, PrevTerm}},
             pre_append_log_follower(Entry, State1)
     end;
 pre_append_log_follower({Idx, Term, {'$ra_cluster_change', _, Cluster, _}},
-                        State) ->
-    ?DEBUG("~ts: ~ts: follower applying ra cluster change to ~w",
+                        #{cluster := PrevCluster,
+                          cluster_index_term := {PrevCITIdx, PrevCITTerm}} = State) ->
+    ?DEBUG("~ts: ~ts: follower applying ra cluster change to ~tw",
            [log_id(State), ?FUNCTION_NAME, maps:keys(Cluster)]),
     State#{cluster => Cluster,
            membership => get_membership(Cluster, State),
-           cluster_index_term => {Idx, Term}};
+           cluster_index_term => {Idx, Term},
+           previous_cluster => {PrevCITIdx, PrevCITTerm, PrevCluster}};
 pre_append_log_follower(_, State) ->
     State.
 

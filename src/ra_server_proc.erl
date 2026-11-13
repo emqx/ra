@@ -52,6 +52,7 @@
          ping/2,
          log_fold/4,
          transfer_leadership/3,
+         force_forget_member/3,
          force_shrink_members_to_current_member/1
         ]).
 
@@ -243,6 +244,11 @@ trigger_election(ServerId, Timeout) ->
     ok | already_leader | {error, term()} | {timeout, ra_server_id()}.
 transfer_leadership(ServerId, TargetServerId, Timeout) ->
     leader_call(ServerId, {transfer_leadership, TargetServerId}, Timeout).
+
+-spec force_forget_member(ra_server_id(), ra_server_id(), timeout()) ->
+    ok | {error, not_member} | {error, term()} | timeout.
+force_forget_member(ServerId, ForgetServerId, Timeout) ->
+    gen_statem_safe_call(ServerId, {force_forget_member, ForgetServerId}, Timeout).
 
 -spec force_shrink_members_to_current_member(ra_server_id()) -> ok.
 force_shrink_members_to_current_member(ServerId) ->
@@ -510,7 +516,7 @@ leader(EventType, {aux_command, Cmd}, State0) ->
     {State, Actions} =
         ?HANDLE_EFFECTS(Effects, EventType,
                         State0#state{server_state = ServerState}),
-    {keep_state, State#state{server_state = ServerState}, Actions};
+    {keep_state, State, Actions};
 leader(EventType, flush_commands,
        #state{conf = #conf{flush_commands_size = Size},
               low_priority_commands = Delayed0} = State0) ->
@@ -638,9 +644,14 @@ candidate(EventType, {aux_command, Cmd}, State0) ->
     {State, Actions} =
         ?HANDLE_EFFECTS(Effects, EventType,
                         State0#state{server_state = ServerState}),
-    {keep_state, State#state{server_state = ServerState}, Actions};
+    {keep_state, State, Actions};
 candidate({call, From}, ping, State) ->
     {keep_state, State, [{reply, From, {pong, candidate}}]};
+candidate(info, {'DOWN', _MRef, process, Pid, Info}, State0) ->
+    handle_process_down(Pid, Info, ?FUNCTION_NAME, State0);
+candidate(info, {Status, Node, InfoList}, State0)
+  when Status =:= nodedown orelse Status =:= nodeup ->
+    handle_node_status_change(Node, Status, InfoList, ?FUNCTION_NAME, State0);
 candidate(info, {node_event, _Node, _Evt}, State) ->
     {keep_state, State};
 candidate(_, tick_timeout, State0) ->
@@ -694,7 +705,7 @@ pre_vote(EventType, {aux_command, Cmd}, State0) ->
     {State, Actions} =
         ?HANDLE_EFFECTS(Effects, EventType,
                         State0#state{server_state = ServerState}),
-    {keep_state, State#state{server_state = ServerState}, Actions};
+    {keep_state, State, Actions};
 pre_vote({call, From}, ping, State) ->
     {keep_state, State, [{reply, From, {pong, pre_vote}}]};
 pre_vote(info, {node_event, _Node, _Evt}, State) ->
@@ -784,7 +795,7 @@ follower(EventType, {aux_command, Cmd}, State0) ->
     {State, Actions} =
         ?HANDLE_EFFECTS(Effects, EventType,
                         State0#state{server_state = ServerState}),
-    {keep_state, State#state{server_state = ServerState}, Actions};
+    {keep_state, State, Actions};
 follower({call, From}, trigger_election, State) ->
     ?DEBUG("~ts: election triggered by ~w", [log_id(State), element(1, From)]),
     {keep_state, State, [{reply, From, ok},
@@ -909,7 +920,43 @@ receive_snapshot(EventType, {aux_command, Cmd}, State0) ->
     {State, Actions} =
         ?HANDLE_EFFECTS(Effects, EventType,
                         State0#state{server_state = ServerState}),
-    {keep_state, State#state{server_state = ServerState}, Actions};
+    {keep_state, State, Actions};
+receive_snapshot(info, {'DOWN', MRef, process, _Pid, Info},
+         #state{leader_monitor = MRef} = State0) ->
+    %% leader is down
+    ?INFO("~ts: receive_snapshot - Leader monitor down. Aborting snapshot receive. "
+          "Entering follower state.",
+          [log_id(State0)]),
+    %% See `follower/3` for reasons behind this distinction:
+    State1 = case Info of
+                 noconnection ->
+                     State0;
+                 _ ->
+                     clear_leader_id(State0)
+             end,
+    receive_snapshot(info, receive_snapshot_timeout,
+                     State1#state{leader_monitor = undefined});
+receive_snapshot(_, {command, Priority, {_CmdType, Data, noreply}},
+                 State) ->
+    %% forward to leader
+    case leader_id(State) of
+        undefined ->
+            ?WARN("~ts: receive_snapshot leader cast - leader not known. "
+                  "Command is dropped.", [log_id(State)]),
+            {keep_state, State, []};
+        LeaderId ->
+            ?DEBUG("~ts: receive_snapshot leader cast - redirecting to ~tw ",
+                   [log_id(State), LeaderId]),
+            ok = ra:pipeline_command(LeaderId, Data, no_correlation, Priority),
+            {keep_state, State, []}
+    end;
+receive_snapshot(cast, {command, _Priority,
+                        {_CmdType, _Data, {notify, Corr, Pid}}},
+                 State) ->
+    _ = reject_command(Pid, Corr, State),
+    {keep_state, State, []};
+receive_snapshot({call, From}, ping, State) ->
+    {keep_state, State, [{reply, From, {pong, receive_snapshot}}]};
 receive_snapshot(EventType, Msg, State0) ->
     case handle_receive_snapshot(Msg, State0) of
         {receive_snapshot, State1, Effects} ->
@@ -1010,7 +1057,7 @@ await_condition(EventType, {aux_command, Cmd}, State0) ->
     {State, Actions} =
         ?HANDLE_EFFECTS(Effects, EventType,
                         State0#state{server_state = ServerState}),
-    {keep_state, State#state{server_state = ServerState}, Actions};
+    {keep_state, State, Actions};
 await_condition({call, From}, ping, State) ->
     {keep_state, State, [{reply, From, {pong, await_condition}}]};
 await_condition({call, From}, trigger_election, State) ->
@@ -1091,6 +1138,7 @@ terminate(Reason, StateName,
             %% This is so that the segment writer can avoid
             %% crashing if it detects a missing key
             catch ra_directory:unregister_name(Names, UId),
+            catch ra_log_wal:forget_writer(maps:get(wal, Names), UId),
             _ = ra_server:terminate(ServerState, Reason),
             catch ra_log_meta:delete_sync(MetaName, UId),
             catch ra_counters:delete(Id),

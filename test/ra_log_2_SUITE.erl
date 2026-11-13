@@ -19,9 +19,12 @@ all() ->
 all_tests() ->
     [
      resend_write_lost_in_wal_crash,
+     writes_not_lost_after_multiple_wal_crashes,
      resend_write_after_tick,
      handle_overwrite,
      handle_overwrite_append,
+     follower_aer_stale_last_written,
+     snapshot_install_then_overwrite_stale_last_written,
      receive_segment,
      delete_during_segment_flush,
      read_one,
@@ -67,8 +70,10 @@ all_tests() ->
      open_segments_limit,
      %% TODO mt: do or deprecate in current minor
      % external_reader,
-     write_config
-    ].
+     write_config,
+
+     segment_close_flush_error_recovery
+   ].
 
 groups() ->
     [
@@ -124,6 +129,78 @@ end_per_testcase(_, Config) ->
 -define(N1, {n1, node()}).
 -define(N2, {n2, node()}).
 % -define(N3, {n3, node()}).
+
+follower_aer_stale_last_written(Config) ->
+    Log0 = ra_log_init(Config),
+    {ok, Log1} = ra_log:write([{1, 1, "one"},
+                               {2, 1, "two"}], Log0),
+
+    %% process WAL write completion for 1 and 2
+    Log2 = receive
+               {ra_log_event, {written, 1, {1, 2}} = Evt} ->
+                   element(1, ra_log:handle_event(Evt, Log1))
+           after 2000 ->
+                     exit(written_timeout)
+           end,
+
+    %% verify last_written is 2
+    {2, 1} = ra_log:last_written(Log2),
+
+    %% Leader change, new leader sends entry 1 in term 2, truncating index 2
+    {ok, Log3} = ra_log:write([{1, 2, "new_one"}], Log2),
+
+    %% verify last_written is truncated to 0 since index 1 is not yet written
+    {0, 0} = ra_log:last_written(Log3),
+
+    ok.
+
+snapshot_install_then_overwrite_stale_last_written(Config) ->
+    %% Reproduces the metadata-store production incident.
+    %%
+    %% A follower installs a snapshot, then receives and writes an
+    %% *uncommitted* tail replicated by the leader. A new leader then
+    %% overwrites (truncates) that tail in a higher term. The follower must
+    %% pull last_written_index_term back to the truncation point. If it does
+    %% not, it reports a stale, higher last_written in its
+    %% append_entries_reply, the leader over-advances that peer's match_index
+    %% and prematurely commits entries that are not persisted on a durable
+    %% majority.
+    Log0 = ra_log_init(Config),
+
+    %% install a snapshot at index 10, term 1 (received from the leader)
+    SnapIdx = 10,
+    SnapTerm = 1,
+    Meta = meta(SnapIdx, SnapTerm, [?N1]),
+    Chunk = create_snapshot_chunk(Config, Meta, #{}),
+    SnapState0 = ra_log:snapshot_state(Log0),
+    {ok, SnapState1} = ra_snapshot:begin_accept(Meta, SnapState0),
+    {ok, SnapState} = ra_snapshot:accept_chunk(Chunk, 1, last, SnapState1),
+    {Log1, _} = ra_log:install_snapshot({SnapIdx, SnapTerm}, SnapState, Log0),
+    ?assertEqual({SnapIdx, SnapTerm}, ra_log:last_written(Log1)),
+
+    %% leader replicates an uncommitted tail 11..15 in term 2
+    {ok, Log2} = ra_log:write([{11, 2, <<"e">>},
+                               {12, 2, <<"e">>},
+                               {13, 2, <<"e">>},
+                               {14, 2, <<"e">>},
+                               {15, 2, <<"e">>}], Log1),
+    %% process the WAL write completion so last_written advances to 15
+    Log3 = receive
+               {ra_log_event, {written, 2, _} = Evt} ->
+                   element(1, ra_log:handle_event(Evt, Log2))
+           after 2000 ->
+                     flush(),
+                     exit(written_timeout)
+           end,
+    ?assertEqual({15, 2}, ra_log:last_written(Log3)),
+
+    %% a new leader in term 3 overwrites from index 13 -> log truncation
+    {ok, Log4} = ra_log:write([{13, 3, <<"new">>}], Log3),
+
+    %% last_written must be pulled back to the last surviving entry (12, 2),
+    %% NOT left stale at (15, 2)
+    ?assertEqual({12, 2}, ra_log:last_written(Log4)),
+    ok.
 
 handle_overwrite(Config) ->
     Log0 = ra_log_init(Config),
@@ -271,16 +348,29 @@ take_after_overwrite_and_init(Config) ->
     Log1 = write_and_roll_no_deliver(1, 5, 1, Log0),
     Log2 = deliver_written_log_events(Log1, 200),
     {[_, _, _, _], Log3} = ra_log_take(1, 4, Log2),
-    Log4 = write_and_roll_no_deliver(1, 2, 2, Log3),
+    Log4 = write_n(1, 2, 2, Log3),
     Log5 = deliver_log_events_cond(Log4,
                                    fun (L) ->
                                            {1, 2} =:= ra_log:last_written(L)
                                    end, 100),
 
+    Keys = [last_written_index_term,
+            last_term,
+            mem_table_range,
+            num_segments,
+            segments_range,
+            first_index,
+            last_index,
+            snapshot_term],
     % ensure we cannot take stale entries
     {[{1, 2, _}], Log6} = ra_log_take(1, 4, Log5),
+    OverviewPre = maps:with(Keys, ra_log:overview(Log6)),
+    ct:pal("overview pre ~p", [ra_log:overview(Log6)]),
     _ = ra_log:close(Log6),
     Log = ra_log_init(Config),
+    OverviewPost = maps:with(Keys, ra_log:overview(Log)),
+    ct:pal("overview ~p", [ra_log:overview(Log)]),
+    ?assertEqual(OverviewPre, OverviewPost),
     {[{1, 2, _}], _} = ra_log_take(1, 4, Log),
     ok.
 
@@ -899,6 +989,49 @@ resend_write_lost_in_wal_crash(Config) ->
                      flush(),
                      ct:fail(resend_write_timeout)
            end,
+    Log5 = ra_log:append({13, 2, banana}, Log4),
+    Log6 = assert_log_events(Log5, fun (L) ->
+                                           {13, 2} == ra_log:last_written(L)
+                                   end),
+    {[_, _, _, _, _], _} = ra_log_take(9, 14, Log6),
+    ra_log:close(Log6),
+
+    ok.
+
+writes_not_lost_after_multiple_wal_crashes(Config) ->
+    Log0 = ra_log_init(Config),
+    {0, 0} = ra_log:last_index_term(Log0),
+    %% write 1..9
+    Log1 = append_n(1, 10, 2, Log0),
+    Log2 = assert_log_events(Log1, fun (L) ->
+                                           {9, 2} == ra_log:last_written(L)
+                                   end),
+    WalPid = whereis(ra_log_wal),
+    %% suspend wal, write an entry then kill it so that the entry is never
+    %% actually written
+    erlang:suspend_process(WalPid),
+    Log2b = append_n(10, 11, 2, Log2),
+    exit(WalPid, kill),
+    wait_for_wal(WalPid),
+    %% one more kill -- the writers snapshot preserves tracking so the
+    %% gap will still be detected
+    WalPid2 = whereis(ra_log_wal),
+    exit(WalPid2, kill),
+    wait_for_wal(WalPid2),
+
+    %% write 11..12 which should trigger resend because the WAL recovered
+    %% writers from the snapshot file and detects the gap at index 10
+    Log3 = append_n(11, 13, 2, Log2b),
+    Log4 = receive
+               {ra_log_event, {resend_write, 10} = Evt} ->
+                   ct:pal("resend triggered as expected"),
+                   element(1, ra_log:handle_event(Evt, Log3))
+           after 500 ->
+                     flush(),
+                     ct:fail(resend_write_timeout)
+           end,
+
+    %% append another entry for good measure
     Log5 = ra_log:append({13, 2, banana}, Log4),
     Log6 = assert_log_events(Log5, fun (L) ->
                                            {13, 2} == ra_log:last_written(L)
@@ -1530,6 +1663,72 @@ write_config(Config) ->
 
     ok.
 
+segment_close_flush_error_recovery(Config) ->
+    %% This test demonstrates that `ra_log_segment:close/1` silently discards
+    %% the return value of `flush/1`, causing the segment writer to report
+    %% segment refs covering entries that were never persisted to disk.
+    %% After restart the WAL file has already been deleted, hence:
+    %% 1. Those entries are permanently lost.
+    %% 2. Subsequent writes may lead to holes in log segments.
+
+    %% 1. Write entries 1-5 and flush them to a segment
+    Log0 = ra_log_init(Config),
+    Log1 = write_n(1, 6, 1, Log0),
+    Log2 = assert_log_events(Log1,
+                             fun (L) -> {5, 1} =:= ra_log:last_written(L) end),
+    ok = ra_log_wal:force_roll_over(ra_log_wal),
+    %% wait for segment delivery — entries 1-5 are now safely on disk
+    Log3 = deliver_log_events_cond(
+             Log2,
+             fun (L) ->
+                     {0, 5} =:= maps:get(segments_range, ra_log:overview(L))
+             end, 100),
+
+    %% 2. Write entries 6-10 and wait for written confirmation
+    Log4 = write_n(6, 11, 1, Log3),
+    Log5 = assert_log_events(Log4,
+                             fun (L) -> {10, 1} =:= ra_log:last_written(L) end),
+
+    %% 3. Meck `ra_log_segment:flush/1` to return IO error.
+    %%    Make sure it fires only once.
+    meck:new(ra_log_segment, [passthrough]),
+    meck:expect(ra_log_segment, flush,
+                fun (_State) ->
+                    spawn(meck, unload, [ra_log_segment]),
+                    {error, enospc}
+                end),
+
+    %% 4. Force WAL roll-over.
+    %%    Segment flush will fail but the log will still report success with a
+    %%    segref covering {0, 10}.
+    ok = ra_log_wal:force_roll_over(ra_log_wal),
+    Log6 = deliver_log_events_cond(
+             Log5,
+             fun (L) ->
+                     {0, 10} =:= maps:get(segments_range, ra_log:overview(L))
+             end, 100),
+
+    %% 5. Write two more entries to the log.
+    %%    Assuming there's just enough disk space for them.
+    Log7 = write_n(11, 13, 1, Log6),
+    Log8 = assert_log_events(Log7,
+                             fun (L) -> {12, 1} =:= ra_log:last_written(L) end),
+
+    %% 6. Stop and restart Ra.
+    ra_log:close(Log8),
+    application:stop(ra),
+    start_ra(Config),
+
+    %% 7. Re-init the log and verify all entries are persisted.
+    %%    With the bug, the segment on disk only contains entries 1-5 and 11-12,
+    %%    but not 6-10.
+    Log9 = ra_log_init(Config),
+    ct:pal("after recovery: ~p", [ra_log:overview(Log9)]),
+
+    validate_fold(1, 12, 1, Log9),
+
+    ra_log:close(Log9).
+
 validate_fold(From, To, Term, Log0) ->
     {Entries0, Log} = ra_log:fold(From, To,
                                   fun (E, A) -> [E | A] end,
@@ -1758,7 +1957,7 @@ new_peer() ->
 flush() ->
     receive
         Any ->
-            ct:pal("flush ~p", [Any]),
+            ct:pal("flush ~tp", [Any]),
             flush()
     after 0 ->
               ok
@@ -1770,7 +1969,7 @@ meta(Idx, Term, Cluster) ->
       cluster => Cluster,
       machine_version => 1}.
 
-create_snapshot_chunk(Config, #{index := Idx} = Meta, Context) ->
+create_snapshot_chunk(Config, #{index := Idx, term := Term} = Meta, Context) ->
     OthDir = filename:join(?config(work_dir, Config), "snapshot_installation"),
     CPDir = filename:join(?config(work_dir, Config), "checkpoints"),
     ok = ra_lib:make_dir(OthDir),
@@ -1781,7 +1980,7 @@ create_snapshot_chunk(Config, #{index := Idx} = Meta, Context) ->
     {Sn1, _} = ra_snapshot:begin_snapshot(Meta, MacRef, snapshot, Sn0),
     Sn2 =
         receive
-            {ra_log_event, {snapshot_written, {Idx, 2} = IdxTerm, snapshot}} ->
+            {ra_log_event, {snapshot_written, {Idx, Term} = IdxTerm, snapshot}} ->
                 ra_snapshot:complete_snapshot(IdxTerm, snapshot, Sn1)
         after 1000 ->
                   exit(snapshot_timeout)
