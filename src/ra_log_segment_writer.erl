@@ -346,10 +346,18 @@ flush_mem_table_range(ServerUId, {Tid, {StartIdx0, EndIdx}},
                                       [SRef | ClosedSegRefs]
                               end,
 
-                    ok = ra_log_segment:close(Segment),
+                    ok = close_log_segment(Segment),
                     _ = ra_lib:sync_dir(Dir),
                     SegRefs
             end
+    end.
+
+close_log_segment(Segment) ->
+    case ra_log_segment:close(Segment) of
+        ok -> ok;
+        {error, Posix} ->
+            FileName = ra_log_segment:filename(Segment),
+            error({segment_writer_sync_close_error, FileName, Posix})
     end.
 
 start_index(ServerUId, StartIdx0) ->
