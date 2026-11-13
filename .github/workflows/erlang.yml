@@ -17,9 +17,7 @@ jobs:
     - name: CHECKOUT
       uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
     - name: CONFIGURE ERLANG
-      # Pin setup-beam to a version that works with Windows (not released at
-      # the time of commit).
-      uses: erlef/setup-beam@566deebc640988a494af16ecdf6f820fe0d3fea4
+      uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
       with:
         otp-version: ${{ matrix.otp_version }}
         rebar3-version: '3.25.1'
