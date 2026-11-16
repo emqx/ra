@@ -427,6 +427,11 @@ is available in a separate repository.
         <td>Indicate whether the segment writer should compute and validate checksums. Default: `true`</td>
         <td>Boolean</td>
     </tr>
+    <tr>
+        <td>segment_write_concurrency</td>
+        <td>Maximum number of servers whose memtables are flushed to segments concurrently within a Ra system. Default: the number of dirty I/O schedulers. Can also be set in the Ra application environment for the default system.</td>
+        <td>Positive integer</td>
+    </tr>
 </table>
 
 ## Logging
