@@ -61,8 +61,10 @@
          %% membership changes
          add_member/2,
          add_member/3,
+         add_confirm_member/3,
          remove_member/2,
          remove_member/3,
+         remove_confirm_member/3,
          leave_and_terminate/3,
          leave_and_terminate/4,
          leave_and_delete_server/3,
@@ -613,6 +615,29 @@ add_member(ServerLoc, ServerId, Timeout) ->
                            {'$ra_join', ServerId, after_log_append},
                            Timeout).
 
+%% @doc Add a ra server id to a ra cluster's membership configuration.
+%% This function returns only after the cluster change is confirmed
+%% by the quorum of members. Note that failure to confirm will manifest
+%% as a timeout, and the cluster change will stay in the log waiting
+%% to either be confirmed or discarded by a new leader.
+%%
+%% @param ServerLoc the ra server or servers to try to send the command to
+%% @param ServerId the ra server id of the new server, or a map with server id and settings.
+%% @param Timeout time to wait for confirmation.
+%% @see add_member/2
+%% @see remove_confirm_member/3
+%% @end
+-spec add_confirm_member(ra_server_id() | [ra_server_id()],
+                         ra_server_id() | ra_new_server(),
+                         timeout()) ->
+    ra_cmd_ret() |
+    {error, already_member} |
+    {error, cluster_change_not_permitted}.
+add_confirm_member(ServerLoc, ServerId, Timeout) ->
+    ra_server_proc:command(ServerLoc,
+                           {'$ra_join', ServerId, await_consensus},
+                           Timeout).
+
 %% @doc Removes a server from the cluster's membership configuration.
 %% This function returns after appending a cluster membership change
 %% command to the log.
@@ -645,6 +670,29 @@ remove_member(ServerRef, ServerId) ->
 remove_member(ServerRef, ServerId, Timeout) ->
     ra_server_proc:command(ServerRef,
                            {'$ra_leave', ServerId, after_log_append},
+                           Timeout).
+
+%% @doc Removes a server from the cluster's membership configuration.
+%% This function returns only after the cluster change is confirmed
+%% by the quorum of members. Note that failure to confirm will manifest
+%% as a timeout, and the cluster change will stay in the log waiting
+%% to either be confirmed or discarded by a new leader.
+%%
+%% @param ServerRef the ra server to send the command to
+%% @param ServerId the ra server id of the server to remove
+%% @param Timeout time to wait for confirmation
+%% @see add_confirm_member/3
+%% @see remove_member/2
+%% @end
+-spec remove_confirm_member(ra_server_id() | [ra_server_id()],
+                            ra_server_id(),
+                            timeout()) ->
+    ra_cmd_ret() |
+    {error, not_member} |
+    {error, cluster_change_not_permitted}.
+remove_confirm_member(ServerRef, ServerId, Timeout) ->
+    ra_server_proc:command(ServerRef,
+                           {'$ra_leave', ServerId, await_consensus},
                            Timeout).
 
 %% @doc Makes the server enter a pre-vote state and attempt to become the leader.

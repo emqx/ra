@@ -30,6 +30,7 @@ all() ->
      append_entries_reply_no_success_from_unknown_peer,
      follower_request_vote,
      follower_pre_vote,
+     pre_vote_does_not_set_voted_for,
      pre_vote_receives_pre_vote,
      await_condition_receives_pre_vote,
      request_vote_rpc_with_lower_term,
@@ -54,9 +55,11 @@ all() ->
      leader_server_leave,
      leader_is_removed,
      follower_cluster_change,
+     follower_cluster_change_overwrite,
      leader_applies_new_cluster,
      leader_applies_new_cluster_nonvoter,
      leader_appends_cluster_change_then_steps_before_applying_it,
+     follower_cluster_change_overwrite_updates_membership,
      leader_receives_install_snapshot_rpc,
      follower_installs_snapshot,
      follower_ignores_installs_snapshot_with_higher_machine_version,
@@ -64,6 +67,10 @@ all() ->
      follower_receives_snapshot_lower_than_last_applied,
      receive_snapshot_timeout,
      receive_snapshot_new_leader_aer,
+     receive_snapshot_request_vote_higher_term,
+     receive_snapshot_request_vote_lower_term,
+     receive_snapshot_pre_vote,
+     receive_snapshot_catchall_drops_unknown,
      snapshotted_follower_received_append_entries,
      leader_received_append_entries_reply_with_stale_last_index,
      leader_receives_install_snapshot_result,
@@ -87,6 +94,7 @@ all() ->
      follower_heartbeat_reply,
      candidate_heartbeat,
      candidate_heartbeat_reply,
+     candidate_install_snapshot_rpc,
      pre_vote_heartbeat,
      pre_vote_heartbeat_reply,
 
@@ -1479,6 +1487,7 @@ follower_pre_vote(_Config) ->
     % when candidate last log entry has a lower term
     % the current server is a better candidate and thus
     % requests that an election timeout is started
+    % pre-vote should update the receiver's term to the highest known
     {follower, #{current_term := 6},
      [start_election_timeout]} =
     ra_server:handle_follower(Msg#pre_vote_rpc{last_log_term = 4,
@@ -1495,6 +1504,38 @@ follower_pre_vote(_Config) ->
     % non-voters ignore pre_vote_rpc
     NVState = State#{membership => promotable},
     {follower, NVState, []} = ra_server:handle_follower(Msg, NVState),
+
+    ok.
+
+pre_vote_does_not_set_voted_for(_Config) ->
+    %% Per Raft thesis Section 9.6, a pre-vote grant must not set
+    %% voted_for. Setting voted_for would block a subsequent real vote
+    %% from a different candidate at the same term.
+    N3 = ?N3,
+    State0 = base_state(3, ?FUNCTION_NAME),
+    Token = make_ref(),
+    Term = 5,
+    Msg = #pre_vote_rpc{candidate_id = ?N2, term = Term,
+                        last_log_index = 3, last_log_term = 5,
+                        machine_version = 0, token = Token},
+
+    %% grant pre-vote to N2
+    {follower, State1,
+     [{reply, #pre_vote_result{term = Term, token = Token,
+                               vote_granted = true}}]} =
+        ra_server:handle_follower(Msg, State0),
+
+    %% voted_for must not be set after pre-vote grant
+    ?assertNot(maps:is_key(voted_for, State1)),
+
+    %% a subsequent real vote from N3 must still succeed —
+    %% the pre-vote grant to N2 must not block it
+    RealVote = #request_vote_rpc{candidate_id = ?N3, term = Term,
+                                 last_log_index = 3, last_log_term = 5},
+    {follower, #{voted_for := N3},
+     [{reply, #request_vote_result{term = Term,
+                                   vote_granted = true}}]} =
+        ra_server:handle_follower(RealVote, State1),
 
     ok.
 
@@ -1927,6 +1968,55 @@ follower_cluster_change(_Config) ->
 
     ok.
 
+%% Test that a new leader overwriting an uncommitted cluster change entry
+%% does not crash the follower with {badkey, previous_cluster}.
+follower_cluster_change_overwrite(_Config) ->
+    N1 = ?N1, N2 = ?N2, N3 = ?N3, N4 = ?N4,
+    OldCluster = #{N1 => new_peer_with(#{next_index => 4, match_index => 3}),
+                   N2 => new_peer_with(#{next_index => 4, match_index => 3}),
+                   N3 => new_peer_with(#{next_index => 4, match_index => 3})},
+    Base = base_state(3, ?FUNCTION_NAME),
+    Cfg = maps:get(cfg, Base),
+    State0 = Base#{cfg => Cfg#cfg{id = N2,
+                                   uid = <<"n2">>,
+                                   log_id = "n2"},
+                   cluster => OldCluster},
+
+    %% N1 (leader, term 5) sends AER with cluster change at index 4.
+    NewCluster = #{N1 => new_peer_with(#{next_index => 4, match_index => 3}),
+                   N2 => new_peer_with(#{next_index => 4, match_index => 3}),
+                   N3 => new_peer_with(#{next_index => 4, match_index => 3}),
+                   N4 => new_peer_with(#{next_index => 1})},
+    ClusterChangeEntry = {4, 5, {'$ra_cluster_change', meta(),
+                                  NewCluster, await_consensus}},
+    AER1 = #append_entries_rpc{term = 5, leader_id = N1,
+                               prev_log_index = 3,
+                               prev_log_term = 5,
+                               leader_commit = 3,
+                               entries = [ClusterChangeEntry]},
+    {follower, State1, _} = ra_server:handle_follower(AER1, State0),
+    {follower, State2, _} = ra_server:handle_follower(written_evt(5, {4, 4}), State1),
+
+    %% Verify follower applied cluster change and stored previous_cluster.
+    ?assertMatch(#{cluster_index_term := {4, 5}}, State2),
+    ?assert(maps:is_key(previous_cluster, State2)),
+
+    %% N3 becomes leader at term 6, overwrites index 4 with a regular entry.
+    RegularEntry = {4, 6, usr(<<"overwrite">>)},
+    AER2 = #append_entries_rpc{term = 6, leader_id = N3,
+                               prev_log_index = 3,
+                               prev_log_term = 5,
+                               leader_commit = 3,
+                               entries = [RegularEntry]},
+
+    %% Before the fix this would crash with {badkey, previous_cluster}.
+    {follower, State3, _} = ra_server:handle_follower(AER2, State2),
+
+    %% Cluster change should be reverted.
+    ?assertMatch(#{cluster_index_term := {0, 0}}, State3),
+    ?assertNot(maps:is_key(N4, maps:get(cluster, State3))),
+    ok.
+
 written_evt(Term, Range) ->
     {ra_log_event, {written, Term, Range}}.
 
@@ -2030,6 +2120,66 @@ leader_appends_cluster_change_then_steps_before_applying_it(_Config) ->
     % assert n1 has switched back to the old cluster config
     #{N1 := _, N2 := _, N3 := _} = Cluster,
     3 = maps:size(Cluster),
+    ok.
+
+follower_cluster_change_overwrite_updates_membership(_Config) ->
+    %% Verify that pre_append_log_follower updates `membership` when
+    %% overwriting a cluster change entry, both when the overwriting entry
+    %% is itself a cluster change and when it triggers a revert.
+    N1 = ?N1, N2 = ?N2, N3 = ?N3, N4 = ?N4,
+    OldCluster = #{N1 => new_peer_with(#{next_index => 4, match_index => 3}),
+                   N2 => new_peer_with(#{next_index => 4, match_index => 3}),
+                   N3 => new_peer_with(#{next_index => 4, match_index => 3})},
+
+    State0 = (base_state(3, ?FUNCTION_NAME))#{cluster => OldCluster},
+
+    %% N1 is leader and adds N4 as a join (cluster change at index 4 term 5).
+    %% This goes through append_cluster_change, which sets previous_cluster.
+    Command = {command, {'$ra_join', meta(), N4, await_consensus}},
+    {leader, #{cluster_index_term := {4, 5},
+               cluster := #{N1 := _, N2 := _, N3 := _, N4 := _}} = State1,
+     _} = ra_server:handle_leader(Command, State0),
+
+    %% Sanity: membership should still be `voter` (N1 is in both clusters).
+    ?assertEqual(voter, maps:get(membership, State1, voter)),
+
+    %% Case 1: A new leader (N2, term 6) overwrites index 4 with a different
+    %% cluster change where N1 has voter_status = promotable.
+    N1Promotable = #{membership => promotable, uid => <<"n1">>},
+    NewCluster = #{N1 => new_peer_with(#{next_index => 4, match_index => 3,
+                                         voter_status => N1Promotable}),
+                   N2 => new_peer_with(#{next_index => 4, match_index => 3}),
+                   N3 => new_peer_with(#{next_index => 4, match_index => 3})},
+    OverwriteCC = {4, 6, {'$ra_cluster_change', meta(),
+                          NewCluster, await_consensus}},
+    AE1 = #append_entries_rpc{term = 6, leader_id = N2,
+                              prev_log_index = 3, prev_log_term = 5,
+                              leader_commit = 3,
+                              entries = [OverwriteCC]},
+    {follower, State2, _} = ra_server:handle_follower(AE1, State1),
+    %% The cluster should be NewCluster (3 members, N1 is promotable).
+    ?assertEqual({4, 6}, maps:get(cluster_index_term, State2)),
+    3 = maps:size(maps:get(cluster, State2)),
+    %% Key assertion: membership should be updated to promotable for N1.
+    ?assertEqual(promotable, maps:get(membership, State2)),
+
+    %% Case 2: Test the revert path. Starting from State1 (leader stepped
+    %% down, cluster change at index 4 term 5 added N4, previous_cluster
+    %% is set to OldCluster). A new leader sends a noop at index 4 term 7,
+    %% which triggers the revert to previous_cluster.
+    NoopEntry = {4, 7, {noop, meta(), 1}},
+    AE2 = #append_entries_rpc{term = 7, leader_id = N2,
+                              prev_log_index = 3, prev_log_term = 5,
+                              leader_commit = 3,
+                              entries = [NoopEntry]},
+    {follower, State3, _} = ra_server:handle_follower(AE2, State1),
+    %% The cluster should revert to OldCluster (N1, N2, N3).
+    RevertedCluster = maps:get(cluster, State3),
+    #{N1 := _, N2 := _, N3 := _} = RevertedCluster,
+    3 = maps:size(RevertedCluster),
+    %% Key assertion: membership should be updated (voter, since N1 has
+    %% no voter_status in OldCluster and falls back to current default).
+    ?assertEqual(voter, maps:get(membership, State3)),
     ok.
 
 is_new(_Config) ->
@@ -2443,6 +2593,122 @@ receive_snapshot_new_leader_aer(_Config) ->
     undefined = ra_snapshot:accepting(SS),
     ok.
 
+receive_snapshot_request_vote_higher_term(_Config) ->
+    %% When receiving a request_vote_rpc with a higher term while in
+    %% receive_snapshot state, we should abort the snapshot and transition
+    %% to follower to participate in the election
+    N1 = ?N1, N2 = ?N2, N3 = ?N3,
+    #{N3 := {_, FState0 = #{cluster := Config,
+                            current_term := CurTerm}, _}}
+    = init_servers([N1, N2, N3], {module, ra_queue, #{}}),
+    FState = FState0#{last_applied => 3},
+    LastTerm = 1,
+    Idx = 6,
+    ISRpc = #install_snapshot_rpc{term = CurTerm, leader_id = N1,
+                                  meta = snap_meta(Idx, LastTerm, Config),
+                                  chunk_state = {1, last},
+                                  data = []},
+    {receive_snapshot, FState1,
+     [{next_event, ISRpc}, {record_leader_msg, _}]} =
+        ra_server:handle_follower(ISRpc, FState),
+
+    %% Now receive a request_vote_rpc with a higher term
+    HigherTerm = CurTerm + 1,
+    VoteRpc = #request_vote_rpc{term = HigherTerm,
+                                candidate_id = N2,
+                                last_log_index = 5,
+                                last_log_term = 1},
+    {follower, #{log := Log, current_term := NewTerm}, [{next_event, VoteRpc}]}
+        = ra_server:handle_receive_snapshot(VoteRpc, FState1),
+    %% term should be updated
+    NewTerm = HigherTerm,
+    %% snapshot should be aborted
+    SS = ra_log:snapshot_state(Log),
+    undefined = ra_snapshot:accepting(SS),
+    ok.
+
+receive_snapshot_request_vote_lower_term(_Config) ->
+    %% When receiving a request_vote_rpc with a lower or equal term while in
+    %% receive_snapshot state, we should reject the vote without aborting
+    N1 = ?N1, N2 = ?N2, N3 = ?N3,
+    #{N3 := {_, FState0 = #{cluster := Config,
+                            current_term := CurTerm}, _}}
+    = init_servers([N1, N2, N3], {module, ra_queue, #{}}),
+    FState = FState0#{last_applied => 3},
+    LastTerm = 1,
+    Idx = 6,
+    ISRpc = #install_snapshot_rpc{term = CurTerm, leader_id = N1,
+                                  meta = snap_meta(Idx, LastTerm, Config),
+                                  chunk_state = {1, last},
+                                  data = []},
+    {receive_snapshot, FState1,
+     [{next_event, ISRpc}, {record_leader_msg, _}]} =
+        ra_server:handle_follower(ISRpc, FState),
+
+    %% Now receive a request_vote_rpc with lower term
+    LowerTerm = CurTerm - 1,
+    VoteRpc = #request_vote_rpc{term = LowerTerm,
+                                candidate_id = N2,
+                                last_log_index = 5,
+                                last_log_term = 1},
+    {receive_snapshot, FState1,
+     [{reply, #request_vote_result{term = CurTerm, vote_granted = false}}]}
+        = ra_server:handle_receive_snapshot(VoteRpc, FState1),
+
+    %% Also test with equal term
+    VoteRpcEqual = #request_vote_rpc{term = CurTerm,
+                                     candidate_id = N2,
+                                     last_log_index = 5,
+                                     last_log_term = 1},
+    {receive_snapshot, FState1,
+     [{reply, #request_vote_result{term = CurTerm, vote_granted = false}}]}
+        = ra_server:handle_receive_snapshot(VoteRpcEqual, FState1),
+    ok.
+
+receive_snapshot_pre_vote(_Config) ->
+    %% When receiving a pre_vote_rpc while in receive_snapshot state,
+    %% we should handle it without aborting the snapshot
+    N1 = ?N1, N2 = ?N2, N3 = ?N3,
+    #{N3 := {_, FState0 = #{cluster := Config,
+                            current_term := CurTerm}, _}}
+    = init_servers([N1, N2, N3], {module, ra_queue, #{}}),
+    FState = FState0#{last_applied => 3},
+    LastTerm = 1,
+    Idx = 6,
+    ISRpc = #install_snapshot_rpc{term = CurTerm, leader_id = N1,
+                                  meta = snap_meta(Idx, LastTerm, Config),
+                                  chunk_state = {1, last},
+                                  data = []},
+    {receive_snapshot, FState1,
+     [{next_event, ISRpc}, {record_leader_msg, _}]} =
+        ra_server:handle_follower(ISRpc, FState),
+
+    %% Now receive a pre_vote_rpc - should stay in receive_snapshot
+    Token = make_ref(),
+    PreVoteRpc = #pre_vote_rpc{term = CurTerm + 1,
+                               candidate_id = N2,
+                               last_log_index = 5,
+                               last_log_term = 1,
+                               machine_version = 0,
+                               token = Token},
+    {receive_snapshot, _FState2, Effects}
+        = ra_server:handle_receive_snapshot(PreVoteRpc, FState1),
+    %% Should have a reply effect with pre_vote_result
+    ?assert(lists:any(fun({reply, #pre_vote_result{}}) -> true;
+                         (_) -> false
+                      end, Effects)),
+    ok.
+
+receive_snapshot_catchall_drops_unknown(_Config) ->
+    %% Verify that the catch-all clause in handle_receive_snapshot
+    %% drops unknown messages without returning a permanent error
+    State = base_state(3, ?FUNCTION_NAME),
+    {receive_snapshot, State, []} =
+        ra_server:handle_receive_snapshot(some_unknown_message, State),
+    {receive_snapshot, State, []} =
+        ra_server:handle_receive_snapshot({weird, tuple, msg}, State),
+    ok.
+
 snapshotted_follower_received_append_entries(_Config) ->
     N1 = ?N1, N2 = ?N2, N3 = ?N3,
     #{N3 := {_, FState00 = #{cluster := Config}, _}} =
@@ -2751,6 +3017,33 @@ candidate_heartbeat_reply(_Config) ->
     {follower, #{current_term := NewTerm,
                  voted_for := undefined}, []}
         = ra_server:handle_candidate({{no_peer, node()}, HeartbeatReply#heartbeat_reply{term = NewTerm}}, State).
+
+candidate_install_snapshot_rpc(_Config) ->
+    N1 = ?N1,
+    State = base_state(3, ?FUNCTION_NAME),
+    #{current_term := Term} = State,
+    Meta = #{index => 99, term => 99,
+             cluster => #{}, machine_version => 0},
+    ISRpc = #install_snapshot_rpc{term = Term, leader_id = N1,
+                                  chunk_state = {1, last},
+                                  meta = Meta, data = []},
+
+    %% Same term: step down to follower and re-dispatch
+    {follower, #{votes := 0}, [{next_event, ISRpc}]}
+        = ra_server:handle_candidate(ISRpc, State),
+
+    %% Higher term: step down to follower and re-dispatch
+    HigherTermISRpc = ISRpc#install_snapshot_rpc{term = Term + 1},
+    {follower, #{votes := 0}, [{next_event, HigherTermISRpc}]}
+        = ra_server:handle_candidate(HigherTermISRpc, State),
+
+    %% Lower term: reject with install_snapshot_result
+    LowerTermISRpc = ISRpc#install_snapshot_rpc{term = Term - 1},
+    {candidate, State,
+     [{reply, #install_snapshot_result{term = Term,
+                                       last_term = 99,
+                                       last_index = 99}}]}
+        = ra_server:handle_candidate(LowerTermISRpc, State).
 
 pre_vote_heartbeat(_Config) ->
     State = (base_state(3, ?FUNCTION_NAME))#{votes => 1},
@@ -3103,13 +3396,13 @@ receive_snapshot_heartbeat_dropped(_Config) ->
     Heartbeat = #heartbeat_rpc{term = Term,
                                query_index = QueryIndex,
                                leader_id = Id},
-    {receive_snapshot, State, [{reply, {error, {unsupported_call, _}}}]} =
+    {receive_snapshot, State, []} =
         ra_server:handle_receive_snapshot(Heartbeat, State),
     %% Term does not matter
-    {receive_snapshot, State, [{reply, {error, {unsupported_call, _}}}]} =
+    {receive_snapshot, State, []} =
         ra_server:handle_receive_snapshot(Heartbeat#heartbeat_rpc{term = Term + 1},
                                           State),
-    {receive_snapshot, State, [{reply, {error, {unsupported_call, _}}}]} =
+    {receive_snapshot, State, []} =
         ra_server:handle_receive_snapshot(Heartbeat#heartbeat_rpc{term = Term - 1},
                                           State).
 
@@ -3120,13 +3413,13 @@ receive_snapshot_heartbeat_reply_dropped(_config) ->
 
     HeartbeatReply = #heartbeat_reply{term = Term,
                                       query_index = QueryIndex},
-    {receive_snapshot, State, [{reply, {error, {unsupported_call, _}}}]} =
+    {receive_snapshot, State, []} =
         ra_server:handle_receive_snapshot(HeartbeatReply, State),
     %% Term does not matter
-    {receive_snapshot, State, [{reply, {error, {unsupported_call, _}}}]} =
+    {receive_snapshot, State, []} =
         ra_server:handle_receive_snapshot(HeartbeatReply#heartbeat_reply{term = Term + 1},
                                           State),
-    {receive_snapshot, State, [{reply, {error, {unsupported_call, _}}}]} =
+    {receive_snapshot, State, []} =
         ra_server:handle_receive_snapshot(HeartbeatReply#heartbeat_reply{term = Term - 1},
                                           State).
 
