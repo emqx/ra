@@ -84,7 +84,7 @@ end_per_testcase(_, Config) ->
 accept_mem_tables(Config) ->
     Dir = ?config(wal_dir, Config),
     UId = ?config(uid, Config),
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{name => ?SEGWR,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{name => ?SEGWR,
                                                             system => default,
                                                             data_dir => Dir}),
     % fake up a mem segment for Self
@@ -122,7 +122,7 @@ accept_mem_tables_append(Config) ->
     % append to a previously written segment
     Dir = ?config(wal_dir, Config),
     UId = ?config(uid, Config),
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{system => default,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{system => default,
                                                             name => ?SEGWR,
                                                             data_dir => Dir}),
     % first batch
@@ -155,7 +155,7 @@ accept_mem_tables_append(Config) ->
 
 accept_mem_tables_overwrite(Config) ->
     Dir = ?config(wal_dir, Config),
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{system => default,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{system => default,
                                                             name => ?SEGWR,
                                                             data_dir => Dir}),
     UId = ?config(uid, Config),
@@ -200,7 +200,7 @@ accept_mem_tables_overwrite(Config) ->
 
 accept_mem_tables_overwrite_same_wal(Config) ->
     Dir = ?config(wal_dir, Config),
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{system => default,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{system => default,
                                                             name => ?SEGWR,
                                                             data_dir => Dir}),
     UId = ?config(uid, Config),
@@ -244,7 +244,7 @@ accept_mem_tables_multi_segment(Config) ->
              system => default,
              name => ?SEGWR,
              segment_conf => #{max_count => 8}},
-    {ok, Pid} = ra_log_segment_writer:start_link(Conf),
+    {ok, Pid} = start_link_log_segment_writer(Conf),
     % more entries than fit a single segment
     Entries = [{I, 2, x} || I <- lists:seq(1, 10)],
     Mt = make_mem_table(UId, Entries),
@@ -271,7 +271,7 @@ accept_mem_tables_multi_segment_max_size(Config) ->
              system => default,
              name => ?SEGWR,
              segment_conf => #{max_size => 1000}},
-    {ok, Pid} = ra_log_segment_writer:start_link(Conf),
+    {ok, Pid} = start_link_log_segment_writer(Conf),
     % more entries than fit a single segment
     Entries = [{I, 2, crypto:strong_rand_bytes(120)} || I <- lists:seq(1, 10)],
     Mt = make_mem_table(UId, Entries),
@@ -298,7 +298,7 @@ accept_mem_tables_multi_segment_overwrite(Config) ->
              system => default,
              name => ?SEGWR,
              segment_conf => #{max_count => 8}},
-    {ok, Pid} = ra_log_segment_writer:start_link(Conf),
+    {ok, Pid} = start_link_log_segment_writer(Conf),
     % more entries than fit a single segment
     Entries = [{I, 2, x} || I <- lists:seq(1, 10)],
     Mt = make_mem_table(UId, Entries),
@@ -351,7 +351,7 @@ accept_mem_tables_for_down_server(Config) ->
                       {DownUId, undefined, undefined, down_uid, undefined}),
     ok = ra_lib:make_dir(filename:join(Dir, DownUId)),
     application:start(sasl),
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{system => default,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{system => default,
                                                             name => ?SEGWR,
                                                             data_dir => Dir}),
     % fake up a mem segment for Self
@@ -407,7 +407,7 @@ accept_mem_tables_with_deleted_server(Config) ->
     DeletedUId = <<"not_self">>,
     ok = ra_lib:make_dir(filename:join(Dir, DeletedUId)),
     application:start(sasl),
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{system => default,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{system => default,
                                                             name => ?SEGWR,
                                                             data_dir => Dir}),
     % fake up a mem segment for Self
@@ -461,7 +461,7 @@ accept_mem_tables_with_deleted_server(Config) ->
 accept_mem_tables_with_corrupt_segment(Config) ->
     Dir = ?config(wal_dir, Config),
     UId = ?config(uid, Config),
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{name => ?SEGWR,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{name => ?SEGWR,
                                                             system => default,
                                                             data_dir => Dir}),
     % fake up a mem segment for Self
@@ -499,7 +499,7 @@ accept_mem_tables_with_corrupt_segment(Config) ->
 accept_mem_tables_multiple_ranges(Config)->
     Dir = ?config(wal_dir, Config),
     SegConf = #{max_count => 16},
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{system => default,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{system => default,
                                                             name => ?SEGWR,
                                                             data_dir => Dir,
                                                             segment_conf => SegConf}),
@@ -533,7 +533,7 @@ accept_mem_tables_multiple_ranges(Config)->
 accept_mem_tables_multiple_ranges_snapshot(Config)->
     Dir = ?config(wal_dir, Config),
     SegConf = #{max_count => 16},
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{system => default,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{system => default,
                                                             name => ?SEGWR,
                                                             data_dir => Dir,
                                                             segment_conf => SegConf}),
@@ -564,7 +564,7 @@ accept_mem_tables_multiple_ranges_snapshot(Config)->
 truncate_segments(Config) ->
     Dir = ?config(wal_dir, Config),
     SegConf = #{max_count => 12},
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(
+    {ok, TblWriterPid} = start_link_log_segment_writer(
                            #{name => ?SEGWR, data_dir => Dir, system => default,
                              segment_conf => SegConf}),
     UId = ?config(uid, Config),
@@ -600,7 +600,7 @@ truncate_segments(Config) ->
 truncate_segments_with_pending_update(Config) ->
     Dir = ?config(wal_dir, Config),
     SegConf = #{max_count => 12},
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{system => default,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{system => default,
                                                             name => ?SEGWR,
                                                             data_dir => Dir,
                                                             segment_conf => SegConf}),
@@ -646,7 +646,7 @@ truncate_segments_with_pending_update(Config) ->
 truncate_segments_with_pending_overwrite(Config) ->
     Dir = ?config(wal_dir, Config),
     SegConf = #{max_count => 12},
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{system => default,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{system => default,
                                                             name => ?SEGWR,
                                                             data_dir => Dir,
                                                             segment_conf => SegConf}),
@@ -708,7 +708,7 @@ truncate_segments_with_pending_overwrite(Config) ->
 
 my_segments(Config) ->
     Dir = ?config(wal_dir, Config),
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{name => ?SEGWR,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{name => ?SEGWR,
                                                             system => default,
                                                             data_dir => Dir}),
     UId = ?config(uid, Config),
@@ -734,7 +734,7 @@ my_segments(Config) ->
 
 upgrade_segment_name_format(Config) ->
     Dir = ?config(wal_dir, Config),
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{name => ?SEGWR,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{name => ?SEGWR,
                                                             system => default,
                                                             data_dir => Dir}),
     UId = ?config(uid, Config),
@@ -764,7 +764,7 @@ upgrade_segment_name_format(Config) ->
     %% also remove upgrade marker file
     ok = file:delete(filename:join(Dir, "segment_name_upgrade_marker")),
     %% restart segment writer which should trigger upgrade process
-    {ok, Pid2} = ra_log_segment_writer:start_link(#{name => ?SEGWR,
+    {ok, Pid2} = start_link_log_segment_writer(#{name => ?SEGWR,
                                                     system => default,
                                                     data_dir => Dir}),
     %% validate the renamed segment has been renamed back to the new
@@ -777,7 +777,7 @@ upgrade_segment_name_format(Config) ->
 skip_entries_lower_than_snapshot_index(Config) ->
     Dir = ?config(wal_dir, Config),
     UId = ?config(uid, Config),
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{system => default,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{system => default,
                                                             name => ?SEGWR,
                                                             data_dir => Dir}),
     % first batch
@@ -812,7 +812,7 @@ skip_entries_lower_than_snapshot_index(Config) ->
 skip_all_entries_lower_than_snapshot_index(Config) ->
     Dir = ?config(wal_dir, Config),
     UId = ?config(uid, Config),
-    {ok, TblWriterPid} = ra_log_segment_writer:start_link(#{system => default,
+    {ok, TblWriterPid} = start_link_log_segment_writer(#{system => default,
                                                             name => ?SEGWR,
                                                             data_dir => Dir}),
     % first batch
@@ -893,3 +893,6 @@ is_wal_file(Config, Name) ->
     Dir = ?config(wal_dir, Config),
     WalFile = filename:join(Dir, Name),
     filelib:is_file(WalFile).
+
+start_link_log_segment_writer(Conf) ->
+    ra_log_segment_writer:start_link(Conf#{write_concurrency => 2}).

@@ -27,7 +27,8 @@
 -record(state, {data_dir :: file:filename(),
                 system :: atom(),
                 counter :: counters:counters_ref(),
-                segment_conf = #{} :: ra_log_segment:ra_log_segment_options()}).
+                segment_conf = #{} :: ra_log_segment:ra_log_segment_options(),
+                write_concurrency :: pos_integer()}).
 
 -include("ra.hrl").
 
@@ -113,7 +114,8 @@ await(SegWriter)  ->
 
 init([#{data_dir := DataDir,
         name := SegWriterName,
-        system := System} = Conf]) ->
+        system := System,
+        write_concurrency := WriteConcurrency} = Conf]) ->
     process_flag(trap_exit, true),
     CRef = ra_counters:new(SegWriterName, ?COUNTER_FIELDS, #{ra_system => System, module => ?MODULE}),
     SegmentConf = maps:get(segment_conf, Conf, #{}),
@@ -121,7 +123,8 @@ init([#{data_dir := DataDir,
     {ok, #state{system = System,
                 data_dir = DataDir,
                 counter = CRef,
-                segment_conf = SegmentConf}}.
+                segment_conf = SegmentConf,
+                write_concurrency = WriteConcurrency}}.
 
 handle_call(await, _From, State) ->
     {reply, ok, State};
@@ -135,11 +138,11 @@ segments_for(UId, #state{data_dir = DataDir}) ->
     Dir = filename:join(DataDir, ra_lib:to_list(UId)),
     segment_files(Dir).
 
-handle_cast({mem_tables, Ranges, WalFile}, #state{system = System} = State) ->
+handle_cast({mem_tables, Ranges, WalFile}, #state{system = System,
+                                                  write_concurrency = Degree} = State) ->
     T1 = erlang:monotonic_time(),
     ok = counters:add(State#state.counter, ?C_MEM_TABLES, map_size(Ranges)),
     #{names := Names} = ra_system:fetch(System),
-    Degree = erlang:system_info(schedulers),
     %% TODO: refactor to make better use of time where each uid has an
     %% uneven amount of work to do.
     RangesList = maps:fold(
